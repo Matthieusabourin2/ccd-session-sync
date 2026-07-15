@@ -1,0 +1,11 @@
+# This repo is TOOLING ONLY. Never commit anyone's actual Claude data here.
+# The real registry history + transcript archive live OUTSIDE this repo, at
+# ~/.ccd-sessions-git and ~/ClaudeArchive — keep them out even if a path collides.
+.ccd-sessions-git/
+ClaudeArchive/
+last-owner
+.tombstones
+*.log
+# rendered (host-specific) plists — only the .template files are tracked
+launchagents/*.plist
+.DS_Store

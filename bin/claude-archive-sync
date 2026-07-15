@@ -1,0 +1,24 @@
+#!/bin/bash
+# claude-archive-sync — archive ~/.claude/projects transcripts (defends against the app's
+# cleanupPeriodDays retention pruning). NO --delete: files the app later prunes stay archived.
+# A daily launchd agent runs this; it also refreshes still-live transcripts.
+set -u
+SRC="${CCD_PROJECTS_DIR:-$HOME/.claude/projects}/"
+DEST="${CCD_ARCHIVE_DIR:-$HOME/ClaudeArchive/claude-projects}/"
+LOG="$(dirname "${DEST%/}")/sync.log"
+MIN_FREE_KB="${CCD_MIN_FREE_KB:-1048576}"    # skip if < 1GiB free, so it never fills the last GB
+mkdir -p "$DEST"
+if [ ! -d "$SRC" ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') SKIP source $SRC not found" >> "$LOG"; exit 0
+fi
+FREE_KB=$(df -k "$HOME" | awk 'NR==2{print $4}')
+if [ "${FREE_KB:-0}" -lt "$MIN_FREE_KB" ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') ALERT free_space=${FREE_KB}KB < ${MIN_FREE_KB}KB — sync SKIPPED" >> "$LOG"
+  exit 0
+fi
+rsync -a "$SRC" "$DEST"
+RC=$?
+FILES=$(find "$DEST" -type f | wc -l | tr -d ' ')
+SIZE=$(du -sh "$DEST" | cut -f1)
+echo "$(date '+%Y-%m-%d %H:%M:%S') rsync_rc=$RC files=$FILES size=$SIZE" >> "$LOG"
+exit $RC

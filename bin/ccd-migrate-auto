@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# ccd-migrate-auto — auto-run ccd-migrate when the Claude Desktop logged-in account changes.
+# Triggered by a launchd WatchPaths agent on cowork-enabled-cli-ops.json (rewritten at login switch).
+# State: $CCD_GIT_DIR/last-owner. Log: $CCD_LOG_DIR/ccd-migrate-auto.log
+set -u
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+WT="${CCD_CLAUDE_DIR:-$HOME/Library/Application Support/Claude}"
+GD="${CCD_GIT_DIR:-$HOME/.ccd-sessions-git}"
+LOGDIR="${CCD_LOG_DIR:-$HOME/ClaudeArchive}"
+OPS="$WT/cowork-enabled-cli-ops.json"
+STATE="$GD/last-owner"
+LOG="$LOGDIR/ccd-migrate-auto.log"
+LOCK="$GD/auto.lock.d"
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+mkdir -p "$LOGDIR"
+
+if ! mkdir "$LOCK" 2>/dev/null; then         # another instance is running
+  echo "$(ts) skipped: another ccd-migrate-auto holds the lock" >> "$LOG"; exit 0
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+owner=$(/usr/bin/python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['ownerAccountId'])" "$OPS" 2>/dev/null) || exit 0
+prev=$(cat "$STATE" 2>/dev/null || echo "")
+if [ -z "$prev" ]; then                      # first run / no state: seed and exit, never auto-migrate blindly
+  echo "$owner" > "$STATE"; echo "$(ts) seeded last-owner=$owner (first run — no migrate)" >> "$LOG"; exit 0
+fi
+[ "$owner" = "$prev" ] && exit 0             # file touched, but no actual account switch
+
+# real switch: give the app time to create the new account's registry dir (created at login)
+for _ in 1 2 3 4 5 6; do
+  [ -d "$WT/claude-code-sessions/$owner" ] && break
+  sleep 10
+done
+
+echo "$(ts) switch detected: ${prev:-none} -> $owner — running ccd-migrate" >> "$LOG"
+out=$("$SELF_DIR/ccd-migrate" 2>&1); rc=$?
+echo "$out" >> "$LOG"
+echo "$(ts) ccd-migrate rc=$rc" >> "$LOG"
+
+if [ "$rc" -eq 0 ]; then
+  echo "$owner" > "$STATE"
+  summary=$(echo "$out" | grep -E '^SUMMARY' | tail -1)
+  /usr/bin/osascript -e "display notification \"${summary:-done} (restart Claude to see the merged list)\" with title \"ccd-migrate: synced\"" 2>/dev/null
+else
+  /usr/bin/osascript -e "display notification \"rc=$rc — see $LOG\" with title \"ccd-migrate: FAILED\"" 2>/dev/null
+fi
+exit 0

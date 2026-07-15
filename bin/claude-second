@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# claude-second — launch a SECOND isolated Claude Desktop instance (for a second account).
+# Data dir: ~/Library/Application Support/Claude-Second  (delete that dir to fully undo).
+#
+# IRON RULE: before LOGGING IN on either instance, fully quit (Cmd+Q) the other one —
+# the claude:// login deep-link is delivered to an arbitrary running instance if both are up.
+# After each instance has been logged in once (with the other quit), both persist independently.
+#
+# This eliminates account switching entirely: one account per instance, each with its own sidebar.
+# Note: the second instance has its own empty MCP config — re-add servers you need. Do NOT run
+# Cowork/local-agent mode in the second instance unless you have disk to spare (it pulls its own
+# multi-GB VM bundles).
+DATADIR="${CCD_SECOND_DATADIR:-$HOME/Library/Application Support/Claude-Second}"
+exec open -n -a "Claude" --args --user-data-dir="$DATADIR"

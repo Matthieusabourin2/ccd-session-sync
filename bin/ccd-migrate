@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# ccd-migrate — git-versioned migration of Claude Desktop session registries between accounts.
+#
+# The Claude Desktop sidebar session list is stored per logged-in account under
+#   ~/Library/Application Support/Claude/claude-code-sessions/<accountUUID>/<orgUUID>/local_*.json
+# Switching accounts empties the visible list because the new account's dir starts empty.
+# The conversation transcripts themselves live account-agnostically in ~/.claude/projects,
+# so this only re-points the sidebar index — it never touches your actual conversations.
+#
+# Usage:
+#   ccd-migrate                 # detect direction, merge other account's entries into current, commit
+#   ccd-migrate --dry-run       # show what would be copied, change nothing
+#   ccd-migrate status          # owner, per-account dirs, uncommitted drift, recent commits
+#   ccd-migrate log [n]         # migration history (default 15)
+#   ccd-migrate undo            # git-revert the last migrate commit (then restart the Claude app)
+#   ccd-migrate snapshot        # commit current state without migrating
+# Overrides (when >2 accounts, or to force direction):
+#   CCD_FROM=<acct-uuid-prefix> CCD_TO=<acct-uuid-prefix> ccd-migrate
+set -euo pipefail
+
+GD="${CCD_GIT_DIR:-$HOME/.ccd-sessions-git}"
+WT="${CCD_CLAUDE_DIR:-$HOME/Library/Application Support/Claude}"
+g() { git --git-dir="$GD" --work-tree="$WT" "$@"; }
+# stage only the tracked paths that actually exist (users without Cowork have no
+# local-agent-mode-sessions dir; a non-matching pathspec would abort under `set -e`).
+stage() {
+  local p ps=""
+  for p in claude-code-sessions local-agent-mode-sessions cowork-enabled-cli-ops.json; do
+    [ -e "$WT/$p" ] && ps="$ps $p"
+  done
+  [ -n "$ps" ] && g add -A -- $ps || true
+}
+usage() {
+  cat <<'EOF'
+ccd-migrate — sync Claude Desktop session index between accounts.
+  ccd-migrate [--dry-run]   merge the other account's entries into the current one
+  ccd-migrate status        accounts, per-dir counts, git state
+  ccd-migrate log [n]       migration history (default 15)
+  ccd-migrate undo          revert the last migrate commit
+  ccd-migrate snapshot      commit current state without migrating
+Env: CCD_FROM=<uuid-prefix> CCD_TO=<uuid-prefix> to force direction (>2 accounts).
+EOF
+}
+
+# parse the subcommand/flag BEFORE touching the filesystem, so --help/unknown never migrate
+cmd="${1:-migrate}"
+case "$cmd" in
+  -h|--help)  usage; exit 0 ;;
+  --dry-run)  cmd=migrate ;;                     # dry-run flag is re-read from "$@" below; keep it there
+  -*)         echo "ccd-migrate: unknown option '$cmd' (try --help)" >&2; exit 2 ;;
+  *)          if [ $# -gt 0 ]; then shift; fi ;;
+esac
+
+[ -d "$GD" ] || { echo "ERROR: git repo $GD missing. Run install.sh first (it bootstraps the repo)." >&2; exit 1; }
+[ -d "$WT/claude-code-sessions" ] || { echo "ERROR: $WT/claude-code-sessions not found — is Claude Desktop installed and launched at least once?" >&2; exit 1; }
+
+case "$cmd" in
+  log)      g log --oneline --stat -"${1:-15}"; exit 0 ;;
+  undo)
+    stage
+    g diff --cached --quiet || g commit -q -m "drift: app-side changes before undo"
+    mig=$(g log --pretty='%H %s' -30 | awk '$2=="migrate:"{print $1; exit}')
+    if [ -z "$mig" ]; then
+      echo "no 'migrate:' commit in the last 30 — nothing to undo. Revert a specific commit manually:" >&2
+      echo "  git --git-dir=\"$GD\" --work-tree=\"$WT\" revert <hash>" >&2
+      exit 1
+    fi
+    g revert --no-edit "$mig"
+    echo "reverted: $(g log --pretty=%s -1 "$mig")  — fully quit and relaunch the Claude app to load it."
+    exit 0 ;;
+  snapshot) stage; g diff --cached --quiet && echo "clean — nothing to snapshot" || g commit -m "snapshot: manual"; exit 0 ;;
+  status)
+    echo "owner: $(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]+"/cowork-enabled-cli-ops.json"))["ownerAccountId"])' "$WT" 2>/dev/null || echo '(unknown)')"
+    python3 - "$WT" <<'PY'
+import glob, os, sys, time
+WT = sys.argv[1]
+for org in sorted(glob.glob(os.path.join(WT, 'claude-code-sessions', '*', '*'))):
+    fs = glob.glob(os.path.join(org, 'local_*.json'))
+    newest = max((os.path.getmtime(f) for f in fs), default=0)
+    ts = time.strftime('%m-%d %H:%M', time.localtime(newest)) if newest else 'empty'
+    print(f"  {len(fs):>3} entries | newest {ts} | {'/'.join(org.split('/')[-2:])}")
+PY
+    echo "uncommitted drift: $(g status --short | wc -l | tr -d ' ') files"; g log --oneline -3
+    exit 0 ;;
+  migrate) : ;;
+  *) echo "unknown command: $cmd" >&2; exit 1 ;;
+esac
+
+DRY=0
+for a in "$@"; do if [ "$a" = "--dry-run" ]; then DRY=1; fi; done
+
+# 1) commit app-side drift first, so the migration diff is isolated
+if [ "$DRY" = 0 ]; then
+  stage
+  g diff --cached --quiet || g commit -q -m "drift: app-side changes before migrate"
+fi
+
+# 2) plan + copy (tombstone-aware, newer-wins); python prints SUMMARY line last
+OUT=$(DRY=$DRY CCD_FROM="${CCD_FROM:-}" CCD_TO="${CCD_TO:-}" python3 - "$WT" <<'PY'
+import glob, json, os, re, shutil, sys, time
+WT = sys.argv[1]; DRY = os.environ.get('DRY') == '1'
+CCS = os.path.join(WT, 'claude-code-sessions'); LAM = os.path.join(WT, 'local-agent-mode-sessions')
+UUID = re.compile(r'^[0-9a-f]{8}-')
+try:
+    owner = json.load(open(os.path.join(WT, 'cowork-enabled-cli-ops.json')))['ownerAccountId']
+except Exception as e:
+    sys.exit(f"ERROR: cannot read ownerAccountId from cowork-enabled-cli-ops.json ({e}). Is Claude Desktop logged in?")
+
+def atomic_copy(s, dpath):  # temp+rename so Claude never sees a half-written index file
+    tmp = f"{dpath}.ccdtmp.{os.getpid()}"
+    shutil.copy2(s, tmp); os.replace(tmp, dpath)
+def newest(org): return max((os.path.getmtime(f) for f in glob.glob(os.path.join(org, 'local_*.json'))), default=0)
+def orgs(acct): return [d for d in glob.glob(os.path.join(CCS, acct, '*')) if os.path.isdir(d)]
+def pick(acct_filter, label):
+    cands = []
+    for a in os.listdir(CCS):
+        if not UUID.match(a) or not acct_filter(a): continue
+        cands += orgs(a)
+    if not cands: sys.exit(f"ERROR: no {label} account dir found under claude-code-sessions")
+    return max(cands, key=newest)
+
+FROM, TO = os.environ.get('CCD_FROM'), os.environ.get('CCD_TO')
+dst = pick((lambda a: a.startswith(TO)) if TO else (lambda a: a == owner), 'destination(owner)')
+dst_acct = os.path.basename(os.path.dirname(dst))
+src = pick((lambda a: a.startswith(FROM)) if FROM else (lambda a: a != dst_acct), 'source')
+if os.path.dirname(src) == os.path.dirname(dst): sys.exit("ERROR: src and dst are the same account (need a second account dir to migrate from)")
+if not FROM:
+    others = {a for a in os.listdir(CCS) if UUID.match(a) and a != dst_acct}
+    if len(others) > 1:
+        print(f"NOTE: {len(others)} non-destination accounts present; auto-picked {os.path.basename(os.path.dirname(src))[:8]} (newest activity). Override with CCD_FROM=<uuid-prefix>.")
+for role, d in (('destination', dst), ('source', src)):
+    n = len(orgs(os.path.basename(os.path.dirname(d))))
+    if n > 1:
+        print(f"WARNING: {role} account {os.path.basename(os.path.dirname(d))[:8]} has {n} org dirs; only the newest is used — verify with --dry-run before committing.")
+
+tomb = set()
+tf = os.path.join(CCS, '.tombstones')
+if os.path.exists(tf): tomb = {l.strip() for l in open(tf) if l.strip()}
+
+new = upd = skip_t = 0
+for f in sorted(glob.glob(os.path.join(src, 'local_*.json'))):
+    b = os.path.basename(f); d = os.path.join(dst, b)
+    if b in tomb: skip_t += 1; continue
+    if not os.path.exists(d): act, new = 'NEW', new + 1
+    elif os.path.getmtime(f) > os.path.getmtime(d) + 1: act, upd = 'UPD', upd + 1
+    else: continue
+    if DRY:
+        try: t = json.load(open(f)).get('title') or '(no title)'
+        except Exception: t = '(unparsable)'
+        print(f"  {act} {b[:22]}… {t[:48]}")
+    else: atomic_copy(f, d)
+
+lamj = lamd = 0
+sa, so = src.split('/')[-2], src.split('/')[-1]
+da, do = dst.split('/')[-2], dst.split('/')[-1]
+lsrc, ldst = os.path.join(LAM, sa, so), os.path.join(LAM, da, do)
+if os.path.isdir(lsrc):
+    if not DRY: os.makedirs(ldst, exist_ok=True)
+    for e in sorted(os.listdir(lsrc)):
+        p = os.path.join(lsrc, e); q = os.path.join(ldst, e)
+        if e in ('rpm', 'cowork-gb-cache.json'): continue
+        if e.endswith('.json') and os.path.isfile(p):
+            if not os.path.exists(q) or os.path.getmtime(p) > os.path.getmtime(q) + 1:
+                lamj += 1
+                if not DRY: atomic_copy(p, q)
+        elif os.path.isdir(p) and e.startswith('local_') and not os.path.exists(q):
+            lamd += 1
+            if not DRY: shutil.copytree(p, q)
+print(f"SUMMARY src={sa[:8]}/{so[:8]} dst={da[:8]}/{do[:8]} new={new} upd={upd} lam_json={lamj} lam_dir={lamd} tombstone_skipped={skip_t}")
+PY
+)
+echo "$OUT"
+S=$(echo "$OUT" | tail -1)
+
+# 3) commit the migration as one isolated commit
+if [ "$DRY" = 1 ]; then
+  echo "(dry run — nothing changed, nothing committed)"
+else
+  stage
+  if g diff --cached --quiet; then
+    echo "nothing to migrate — registries already in sync"
+  else
+    g commit -q -m "migrate: ${S#SUMMARY }"
+    echo "committed: $(g log --oneline -1)"
+    echo "Fully quit and relaunch the Claude app to load the merged list."
+  fi
+fi

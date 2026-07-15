@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ccd-session-sync.migrate-auto</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BIN__/ccd-migrate-auto</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>WatchPaths</key>
+    <array>
+        <string>__HOME__/Library/Application Support/Claude/cowork-enabled-cli-ops.json</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__ARCHIVE__/ccd-migrate-auto-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__ARCHIVE__/ccd-migrate-auto-launchd.log</string>
+</dict>
+</plist>
