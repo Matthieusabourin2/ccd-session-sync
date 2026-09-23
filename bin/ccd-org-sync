@@ -27,6 +27,9 @@ BLOCKED = os.path.join(BK, 'BLOCKED')
 LOG = os.path.join(BK, 'sync.log')
 # app files whose mtime (never content) tells us Desktop is busy; config.json holds the OAuth cache
 BUSY_FILES = ['config.json', 'mcp-user-tool-toggles.json', 'plan-usage-history.json']
+# entry fields Desktop rewrites in the background without touching lastActivityAt/lastFocusedAt
+# (observed 2.7032: PR status refresh). Anything else differing at equal version -> ABORT.
+BACKGROUND_FIELDS = {'prs'}
 
 
 class Abort(Exception):
@@ -143,7 +146,8 @@ def plan(pair, only=None):
     tomb = ta | tb
     tx = {os.path.basename(f)[:-len('.jsonl')] for f in glob.glob(os.path.join(PROJECTS, '*', '*.jsonl'))}
     ops, conflicts = [], []
-    c = dict.fromkeys(['common_identical', 'tombstone_skipped', 'dead_skipped', 'scheduled_task_skipped'], 0)
+    c = dict.fromkeys(['common_identical', 'tombstone_skipped', 'dead_skipped', 'scheduled_task_skipped',
+                       'background_refresh'], 0)
     cat = dict.fromkeys(['archived', 'scheduled_task', 'scratch_cwd', 'worktree_cwd'], 0)
     ids = set(ea) | set(eb)
     if only:
@@ -161,8 +165,15 @@ def plan(pair, only=None):
                 continue
             va, vb = version(a[1]), version(b[1])
             if va == vb:
-                conflicts.append(sid)
-                continue
+                # Desktop refreshes some fields in the background without bumping the activity
+                # timestamps; for those only, the newer file wins (we never write differing content,
+                # so a newer mtime on differing content is always a Desktop write).
+                diff = {k for k in set(a[1]) | set(b[1]) if a[1].get(k) != b[1].get(k)}
+                if not diff <= BACKGROUND_FIELDS or a[2].st_mtime_ns == b[2].st_mtime_ns:
+                    conflicts.append(sid)
+                    continue
+                va, vb = a[2].st_mtime_ns, b[2].st_mtime_ns
+                c['background_refresh'] += 1
             # newer flows to older; op = (kind, src_label, dst_label, dst_dir, sid, src, dst)
             op = ('UPD', la, lb, db, sid, a, b) if va > vb else ('UPD', lb, la, da, sid, b, a)
         else:

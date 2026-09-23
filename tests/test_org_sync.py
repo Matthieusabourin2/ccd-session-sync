@@ -97,6 +97,20 @@ class OrgSyncTest(unittest.TestCase):
         self.run_sync('unblock')
         self.assertIn('conflict', self.run_sync('sync').stderr)
 
+    def test_background_pr_refresh_newer_file_wins(self):
+        self.put(MAX, entry('c', prs=[{'state': 'OPEN'}]))
+        self.put(TEAM, entry('c', prs=[{'state': 'MERGED'}]))
+        t = os.path.getmtime(os.path.join(self.org(MAX), 'local_c.json'))
+        os.utime(os.path.join(self.org(MAX), 'local_c.json'), (t - 100, t - 100))
+        r = self.run_sync('sync'); self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.get(MAX, 'c')['prs'], [{'state': 'MERGED'}])
+
+    def test_background_field_plus_other_field_still_aborts(self):
+        self.put(MAX, entry('c', prs=[1], title='x'))
+        self.put(TEAM, entry('c', prs=[2], title='y'))
+        os.utime(os.path.join(self.org(MAX), 'local_c.json'), (1, 1))
+        self.assertIn('conflict', self.run_sync('sync').stderr)
+
     def test_invalid_json_aborts_without_writes(self):
         self.put(MAX, entry('a'))
         with open(os.path.join(self.org(TEAM), 'local_bad.json'), 'w') as f:
