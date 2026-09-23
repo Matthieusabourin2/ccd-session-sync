@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""ccd-org-sync — keep the Claude Desktop Code sidebar identical across two orgs of ONE account
+(e.g. Personal/Max and a Team org), switched with the app's native org switcher.
+
+Desktop keeps one sidebar index per org:
+  ~/Library/Application Support/Claude/claude-code-sessions/<account>/<org>/local_<uuid>.json
+Transcripts live org-agnostically in ~/.claude/projects and are never touched here.
+Observed (Desktop 2.7032): the app re-reads the index on every org switch and only writes the
+ACTIVE org's dir, so merging entries into the other dir makes them appear on the next switch.
+
+  ccd-org-sync sync [--dry-run] [--only <sessionId>] [--verbose]
+  ccd-org-sync status
+  ccd-org-sync rollback <snapshot-ts>
+  ccd-org-sync unblock
+Pair (required): CCD_PAIR="MAX=<acct>/<org>,TEAM=<acct>/<org>"  (or --pair)
+"""
+import glob, hashlib, json, os, shutil, subprocess, sys, time
+
+ROOT = os.environ.get('CCD_CLAUDE_DIR', os.path.expanduser('~/Library/Application Support/Claude'))
+PROJECTS = os.environ.get('CCD_PROJECTS_DIR', os.path.expanduser('~/.claude/projects'))
+BK = os.environ.get('CCD_BACKUP_DIR', os.path.expanduser('~/.claude/ccd-session-sync-backups'))
+QUIET = float(os.environ.get('CCD_QUIET_SECONDS', '15'))
+QUIET_MAX_WAIT = float(os.environ.get('CCD_QUIET_MAX_WAIT', '180'))
+KEEP = int(os.environ.get('CCD_KEEP_SNAPSHOTS', '50'))
+CCS = os.path.join(ROOT, 'claude-code-sessions')
+BLOCKED = os.path.join(BK, 'BLOCKED')
+LOG = os.path.join(BK, 'sync.log')
+# app files whose mtime (never content) tells us Desktop is busy; config.json holds the OAuth cache
+BUSY_FILES = ['config.json', 'mcp-user-tool-toggles.json', 'plan-usage-history.json']
+
+
+class Abort(Exception):
+    pass
+
+
+def log(msg):
+    os.makedirs(BK, exist_ok=True)
+    with open(LOG, 'a') as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+
+
+def notify(title, msg):
+    if os.environ.get('CCD_NO_NOTIFY'):
+        return
+    subprocess.run(['/usr/bin/osascript', '-e', f'display notification "{msg}" with title "{title}"'],
+                   capture_output=True)
+
+
+def sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def desktop_version():
+    try:
+        out = subprocess.run(['defaults', 'read', '/Applications/Claude.app/Contents/Info.plist',
+                              'CFBundleShortVersionString'], capture_output=True, text=True)
+        return out.stdout.strip() or 'unknown'
+    except Exception:
+        return 'unknown'
+
+
+def parse_pair(spec):
+    if not spec:
+        raise Abort('no org pair configured (CCD_PAIR="MAX=<acct>/<org>,TEAM=<acct>/<org>")')
+    pair = {}
+    for part in spec.split(','):
+        label, _, rel = part.partition('=')
+        if not label or rel.count('/') != 1:
+            raise Abort(f'bad pair element: {part!r}')
+        pair[label.strip()] = rel.strip()
+    if len(pair) != 2:
+        raise Abort('pair must name exactly 2 orgs')
+    (la, ra), (lb, rb) = pair.items()
+    if ra.split('/')[0] != rb.split('/')[0] or ra == rb:
+        raise Abort('both orgs must belong to the same account and differ')
+    return [(la, os.path.join(CCS, ra)), (lb, os.path.join(CCS, rb))]
+
+
+def check_owner(pair):
+    acct = os.path.basename(os.path.dirname(pair[0][1]))
+    try:
+        owner = json.load(open(os.path.join(ROOT, 'cowork-enabled-cli-ops.json')))['ownerAccountId']
+    except Exception as e:
+        raise Abort(f'cannot read ownerAccountId ({type(e).__name__})')
+    if owner != acct:
+        raise Abort(f'logged-in account {owner[:8]} is not the paired account {acct[:8]} — refusing')
+    for label, d in pair:
+        if not os.path.isdir(d):
+            raise Abort(f'{label} index dir missing: {d}')
+
+
+def newest_activity(pair):
+    ts = [os.path.getmtime(d) for _, d in pair]
+    for _, d in pair:
+        ts += [os.path.getmtime(f) for f in glob.glob(os.path.join(d, 'local_*.json'))]
+    for f in BUSY_FILES:
+        p = os.path.join(ROOT, f)
+        if os.path.exists(p):
+            ts.append(os.path.getmtime(p))
+    return max(ts)
+
+
+def wait_quiet(pair):
+    deadline = time.time() + QUIET_MAX_WAIT
+    while True:
+        idle = time.time() - newest_activity(pair)
+        if idle >= QUIET:
+            return
+        if time.time() > deadline:
+            raise Abort(f'Desktop never went quiet for {QUIET:.0f}s — retry later')
+        time.sleep(min(QUIET - idle, 5) + 0.2)
+
+
+def load_org(d):
+    """-> (entries{sid: (bytes, obj, stat)}, tombstones{sid})"""
+    entries, tomb = {}, set()
+    for f in glob.glob(os.path.join(d, 'deleted_*')):
+        tomb.add(os.path.basename(f)[len('deleted_'):])
+    for f in glob.glob(os.path.join(d, 'local_*.json')):
+        stem = os.path.basename(f)[:-len('.json')]
+        raw = open(f, 'rb').read()
+        st = os.stat(f)
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            raise Abort(f'invalid JSON in {os.path.basename(f)} — unknown format, no writes')
+        if not isinstance(obj, dict) or obj.get('sessionId') != stem \
+                or not isinstance(obj.get('lastActivityAt'), int) or not isinstance(obj.get('cwd'), str):
+            raise Abort(f'unexpected schema in {os.path.basename(f)} — no writes')
+        entries[stem] = (raw, obj, st)
+    return entries, tomb
+
+
+def version(obj):
+    lf = obj.get('lastFocusedAt')
+    return (obj['lastActivityAt'], lf if isinstance(lf, int) else 0)
+
+
+def plan(pair, only=None):
+    (la, da), (lb, db) = pair
+    ea, ta = load_org(da)
+    eb, tb = load_org(db)
+    tomb = ta | tb
+    tx = {os.path.basename(f)[:-len('.jsonl')] for f in glob.glob(os.path.join(PROJECTS, '*', '*.jsonl'))}
+    ops, conflicts = [], []
+    c = dict.fromkeys(['common_identical', 'tombstone_skipped', 'dead_skipped', 'older_kept'], 0)
+    cat = dict.fromkeys(['archived', 'scheduled_task', 'scratch_cwd', 'worktree_cwd'], 0)
+    ids = set(ea) | set(eb)
+    if only:
+        ids &= {only}
+        if not ids:
+            raise Abort(f'--only {only}: no such session in either org')
+    for sid in sorted(ids):
+        if sid[len('local_'):] in tomb:
+            c['tombstone_skipped'] += 1
+            continue
+        a, b = ea.get(sid), eb.get(sid)
+        if a and b:
+            if a[0] == b[0] or a[1] == b[1]:
+                c['common_identical'] += 1
+                continue
+            va, vb = version(a[1]), version(b[1])
+            if va == vb:
+                conflicts.append(sid)
+                continue
+            # newer flows to older; op = (kind, src_label, dst_label, dst_dir, sid, src, dst)
+            op = ('UPD', la, lb, db, sid, a, b) if va > vb else ('UPD', lb, la, da, sid, b, a)
+        else:
+            s = a or b
+            if s[1].get('cliSessionId') not in tx:
+                c['dead_skipped'] += 1
+                continue
+            op = ('NEW', la, lb, db, sid, a, None) if a else ('NEW', lb, la, da, sid, b, None)
+        o = op[5][1]
+        cat['archived'] += bool(o.get('isArchived'))
+        cat['scheduled_task'] += bool(o.get('scheduledTaskId'))
+        cat['scratch_cwd'] += '/scratch-workspaces/' in o.get('cwd', '')
+        cat['worktree_cwd'] += '/.claude/worktrees/' in o.get('cwd', '')
+        ops.append(op)
+    stats = {la: len(ea), lb: len(eb), 'common': len(set(ea) & set(eb)),
+             f'{la}_only': len(set(ea) - set(eb)), f'{lb}_only': len(set(eb) - set(ea)),
+             'conflicts': len(conflicts), **c, 'to_create': sum(o[0] == 'NEW' for o in ops),
+             'to_update': sum(o[0] == 'UPD' for o in ops), 'categories_of_writes': cat}
+    return ops, conflicts, stats
+
+
+def apply(ops, pair):
+    ts = time.strftime('%Y%m%d-%H%M%S') + f'-{os.getpid()}'
+    snap = os.path.join(BK, ts)
+    os.makedirs(os.path.join(snap, 'files'))
+    man = {'timestamp': ts, 'claude_desktop_version': desktop_version(), 'status': 'in-progress',
+           'pair': {l: os.path.relpath(d, CCS) for l, d in pair}, 'ops': []}
+    for kind, sl, dl, ddir, sid, s, d in ops:
+        dst = os.path.join(ddir, sid + '.json')
+        rec = {'op': kind, 'source_space': sl, 'destination_space': dl, 'path': dst,
+               'sha256_after': sha(s[0]), 'sha256_before': sha(d[0]) if d else None}
+        if d:
+            bpath = os.path.join(snap, 'files', dl, sid + '.json')
+            os.makedirs(os.path.dirname(bpath), exist_ok=True)
+            with open(bpath, 'wb') as f:
+                f.write(d[0])
+            rec['backup'] = os.path.relpath(bpath, snap)
+        man['ops'].append(rec)
+    write_manifest(snap, man)
+    crash_after = int(os.environ.get('CCD_TEST_CRASH_AFTER', '-1'))
+    done = 0
+    for (kind, sl, dl, ddir, sid, s, d), rec in zip(ops, man['ops']):
+        dst = rec['path']
+        tmp = os.path.join(ddir, f'.ccdsync-{os.getpid()}-{done}.tmp')
+        with open(tmp, 'wb') as f:
+            f.write(s[0]); f.flush(); os.fsync(f.fileno())
+        if sha(open(tmp, 'rb').read()) != rec['sha256_after']:
+            os.unlink(tmp); raise Abort('temp file verification failed')
+        # compare-and-swap: the destination must still be exactly what we planned against
+        if d is None:
+            if os.path.exists(dst):
+                os.unlink(tmp); raise Abort(f'{sid[:14]} appeared in {dl} during sync')
+        else:
+            st = os.stat(dst)
+            if (st.st_mtime_ns, st.st_size) != (d[2].st_mtime_ns, d[2].st_size):
+                os.unlink(tmp); raise Abort(f'{sid[:14]} changed in {dl} during sync')
+        os.replace(tmp, dst)
+        done += 1
+        if done == crash_after:
+            os._exit(9)  # test hook: simulate a kill mid-run
+    man['status'] = 'done'
+    write_manifest(snap, man)
+    prune()
+    return ts
+
+
+def write_manifest(snap, man):
+    p = os.path.join(snap, 'manifest.json')
+    tmp = p + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(man, f, indent=1); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, p)
+
+
+def prune():
+    snaps = sorted(d for d in os.listdir(BK) if os.path.isfile(os.path.join(BK, d, 'manifest.json')))
+    for d in snaps[:-KEEP]:
+        shutil.rmtree(os.path.join(BK, d))
+
+
+def cmd_sync(args, pair):
+    dry = '--dry-run' in args
+    only = args[args.index('--only') + 1] if '--only' in args else None
+    if os.path.exists(BLOCKED) and not dry:
+        raise Abort(f'blocked since a previous abort ({open(BLOCKED).read().strip()}) — fix, then `ccd-org-sync unblock`')
+    check_owner(pair)
+    if not dry:
+        wait_quiet(pair)
+    ops, conflicts, stats = plan(pair, only)
+    print(json.dumps(stats, indent=1))
+    if '--verbose' in args:
+        for kind, sl, dl, _, sid, s, _ in ops:
+            print(f'  {kind} {sl}->{dl} {sid[:14]} cwd={s[1]["cwd"]}')
+        for sid in conflicts:
+            print(f'  CONFLICT {sid[:14]}')
+    if conflicts:
+        msg = f'{len(conflicts)} conflict(s): same version, different content ({conflicts[0][:14]}…)'
+        if not dry:
+            with open(BLOCKED, 'w') as f:
+                f.write(msg)
+            notify('ccd-org-sync: BLOCKED', msg)
+        raise Abort(msg)
+    if dry:
+        print('DRY RUN — NO FILES MODIFIED')
+        return
+    if not ops:
+        return
+    ts = apply(ops, pair)
+    log(f'sync snapshot={ts} created={stats["to_create"]} updated={stats["to_update"]} result=ok')
+    print(f'snapshot {ts}: created={stats["to_create"]} updated={stats["to_update"]}')
+
+
+def cmd_rollback(ts):
+    snap = os.path.join(BK, ts)
+    man = json.load(open(os.path.join(snap, 'manifest.json')))
+    todo = []
+    for r in man['ops']:  # classify by current bytes (works after a crash mid-run too)
+        cur = sha(open(r['path'], 'rb').read()) if os.path.exists(r['path']) else None
+        if cur == r['sha256_after']:
+            todo.append(r)                      # applied -> revert
+        elif cur != r['sha256_before']:         # neither ours nor the original: changed since
+            raise Abort(f'{os.path.basename(r["path"])[:20]} changed since snapshot {ts} — rollback refused')
+    parked = os.path.join(snap, 'rolled-back-created')
+    for r in todo:
+        if r['op'] == 'UPD':
+            data = open(os.path.join(snap, r['backup']), 'rb').read()
+            tmp = r['path'] + '.ccdrb.tmp'
+            with open(tmp, 'wb') as f:
+                f.write(data); f.flush(); os.fsync(f.fileno())
+            os.replace(tmp, r['path'])
+            if sha(open(r['path'], 'rb').read()) != r['sha256_before']:
+                raise Abort(f'restore verification failed for {r["path"]}')
+        else:  # created by us: move aside into the snapshot, never delete
+            os.makedirs(parked, exist_ok=True)
+            shutil.move(r['path'], os.path.join(parked, os.path.basename(r['path'])))
+    man['status'] = 'rolled-back'
+    write_manifest(snap, man)
+    with open(BLOCKED, 'w') as f:  # keep the watcher from immediately re-applying it
+        f.write(f'rolled back {ts}')
+    log(f'rollback snapshot={ts} files={len(todo)} result=ok (sync now blocked; `unblock` to resume)')
+    print(f'rolled back {len(todo)} file(s); sync blocked until `ccd-org-sync unblock`')
+
+
+def cmd_status(pair):
+    for label, d in pair:
+        n = len(glob.glob(os.path.join(d, 'local_*.json')))
+        print(f'{label:>6}: {n:4} entries  {os.path.relpath(d, CCS)}')
+    print('blocked:', open(BLOCKED).read().strip() if os.path.exists(BLOCKED) else 'no')
+    if os.path.exists(LOG):
+        print(''.join(open(LOG).readlines()[-5:]), end='')
+
+
+def main(argv):
+    args = argv[1:]
+    if not args or args[0] in ('-h', '--help'):
+        print(__doc__); return 0
+    spec = os.environ.get('CCD_PAIR', '')
+    if '--pair' in args:
+        spec = args[args.index('--pair') + 1]
+    cmd = args[0]
+    try:
+        os.makedirs(BK, exist_ok=True)
+        if cmd == 'unblock':
+            if os.path.exists(BLOCKED):
+                os.unlink(BLOCKED)
+            print('unblocked'); return 0
+        if cmd == 'rollback':
+            cmd_rollback(args[1]); return 0
+        pair = parse_pair(spec)
+        if cmd == 'sync':
+            cmd_sync(args[1:], pair); return 0
+        if cmd == 'status':
+            cmd_status(pair); return 0
+        print(f'unknown command {cmd}', file=sys.stderr); return 2
+    except Abort as e:
+        log(f'{cmd} ABORT {e}')
+        print(f'ABORT: {e}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
