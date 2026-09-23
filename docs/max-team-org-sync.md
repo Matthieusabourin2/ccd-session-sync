@@ -60,7 +60,6 @@ ccd-org-sync unblock                      # resume after a conflict or rollback
 - If you switch org less than ~15 s after the last activity, the newest metadata (title, turn count, a brand-new session) lands after the switch and shows on the next switch. Transcript content is unaffected: it is read directly from the shared `.jsonl`.
 - Internal, undocumented format: a Desktop update that changes the schema makes the tool refuse to write (fail closed) — check `sync.log`.
 - The initial bulk migration was run with Desktop fully quit; steady-state runs write while Desktop runs, mostly into the inactive org.
-
 - Not yet verified: when a newer entry lands in the org that is **active** at that moment (switch within the quiet window), Desktop may keep its stale in-memory copy and re-write it on the next focus; only metadata could regress, never the transcript.
 - `archived-sessions.idx` is per org and not synced; archive state is carried by the entry's `isArchived` flag only.
 - Deleting a session in one org is not propagated; the copy in the other org stays (not resurrected where a tombstone exists).
