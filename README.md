@@ -1,5 +1,42 @@
 # ccd-session-sync
 
+> **This fork adds `ccd-org-sync`** for one account with two orgs (e.g. Personal/Max + a Team org) switched with Claude Desktop's **native** org switcher. The upstream tools below assume two *different accounts* and don't handle this case. See [the section right below](#same-account-two-orgs-maxteam--ccd-org-sync).
+
+## Same account, two orgs (Max/Team) — `ccd-org-sync`
+
+### 1. What it is
+Claude Desktop keeps one Code sidebar index **per org**. When you use the native switcher to go from Personal/Max to Team, you get a different list of folders and sessions, although the transcripts in `~/.claude/projects` are shared. That hurts when your Max quota runs out mid-session: you switch to Team and the session is gone from the sidebar. `ccd-org-sync` keeps both orgs' indexes merged. The same folders and sessions appear on both sides, and a session continued under Team shows its continuation back under Max. It never touches transcripts, credentials, the org switch itself, classic chats or Cowork.
+
+### 2. How it works
+```
+  ~/.claude/projects/*/<cli>.jsonl   (shared transcripts — never written)
+                 ▲ cliSessionId
+  claude-code-sessions/<acct>/<MAX org>/local_*.json   ◄──┐
+  claude-code-sessions/<acct>/<TEAM org>/local_*.json  ◄──┤ union merge, per entry:
+                                                           │ newer (lastActivityAt, lastFocusedAt) wins,
+  launchd WatchPaths on both dirs ──► ccd-org-sync sync ──┘ equal+different → ABORT
+```
+Desktop only writes the active org's index and re-reads the index on every switch. Whatever you do under one org is therefore merged into the other org's index within seconds, and it's there the next time you switch. You don't need a restart or a manual command. Every writing run takes a SHA-256 manifest snapshot, so it can be rolled back. Full rules, observed facts and safety mechanics are in [docs/max-team-org-sync.md](docs/max-team-org-sync.md).
+
+### 3. How to use it
+Prereqs: macOS, `python3`, Claude Desktop logged in, and the two org ids from `ls ~/Library/Application\ Support/Claude/claude-code-sessions/<account>/`.
+```bash
+PAIR="MAX=<account>/<max-org>,TEAM=<account>/<team-org>"
+CCD_PAIR="$PAIR" bin/ccd-org-sync sync --dry-run     # preview, writes nothing
+# first bulk merge with Desktop fully quit (Cmd+Q), then relaunch:
+CCD_PAIR="$PAIR" bin/ccd-org-sync sync
+./install-org-sync.sh "$PAIR"                        # ~/bin/ccd-org-sync + one launchd agent
+```
+From then on you just switch orgs natively. The only manual steps left:
+- On a **"ccd-org-sync: BLOCKED"** notification, follow the runbook, then run `ccd-org-sync unblock`.
+- To undo, run `ccd-org-sync rollback <ts>`. To remove, run `./install-org-sync.sh --uninstall`.
+
+Tests: `python3 -m unittest tests/test_org_sync.py`. `install-org-sync.sh` installs **only** this tool. It does not install `claude-archive-sync` or `claude-second`.
+
+---
+
+## Upstream: switching between two different accounts
+
 Keep your **Claude Desktop** sidebar session list intact when you switch between Claude accounts on macOS — plus a transcript backup that survives the 30‑day cleanup, all git‑versioned and reversible.
 
 > Solves the problem in [anthropics/claude-code#48511](https://github.com/anthropics/claude-code/issues/48511) ("session history lost when switching accounts", closed *not planned*) and [#74662](https://github.com/anthropics/claude-code/issues/74662) (request for a local‑sessions view). If Anthropic ships a native fix, you can uninstall this and lose nothing.
