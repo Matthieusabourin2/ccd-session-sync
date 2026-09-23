@@ -31,6 +31,10 @@ BUSY_FILES = ['config.json', 'mcp-user-tool-toggles.json', 'plan-usage-history.j
 # entry fields Desktop rewrites in the background without touching lastActivityAt/lastFocusedAt
 # (observed 2.7032: PR status refresh). Anything else differing at equal version -> ABORT.
 BACKGROUND_FIELDS = {'prs', 'prState', 'prNumber', 'prUrl', 'prRepository'}
+# the title is merged on its own: a rename does not bump lastActivityAt, so it must not be lost to
+# newer activity in the other org. previousTitles (rename history) decides; else human > automatic.
+TITLE_FIELDS = {'title', 'titleSource', 'titleTurn', 'previousTitles'}
+HUMAN_TITLE = {'user', 'tool'}
 
 
 class Abort(Exception):
@@ -144,6 +148,51 @@ def version(obj):
     return (obj['lastActivityAt'], lf if isinstance(lf, int) else 0)
 
 
+def title_group(o):
+    return {k: o[k] for k in TITLE_FIELDS if k in o}
+
+
+def title_winner(x, y):
+    """which entry's title group is the latest intent: 'x', 'y', 'entry' (no preference) or None."""
+    if title_group(x) == title_group(y):
+        return 'entry'
+    if x.get('title') in (y.get('previousTitles') or []):
+        return 'y'                      # y was renamed from x's title
+    if y.get('title') in (x.get('previousTitles') or []):
+        return 'x'
+    ux, uy = x.get('titleSource') in HUMAN_TITLE, y.get('titleSource') in HUMAN_TITLE
+    if ux != uy:
+        return 'x' if ux else 'y'       # a chosen title beats an automatic one
+    return 'entry' if not ux else None  # two different chosen titles, no history: ambiguous
+
+
+def merge(a, b):
+    """-> (merged_obj, background_refresh_used) or None when ambiguous (conflict)."""
+    x, y = a[1], b[1]
+    tw = title_winner(x, y)
+    if tw is None:
+        return None
+    va, vb = version(x), version(y)
+    bg, same_version = 0, va == vb
+    if same_version:
+        rest = {k for k in set(x) | set(y) if x.get(k) != y.get(k)} - TITLE_FIELDS
+        if rest and not rest <= BACKGROUND_FIELDS:
+            return None
+        if rest:  # background-only refresh: the newer file is a Desktop write (we copy verbatim)
+            if a[2] is None or b[2] is None or a[2].st_mtime_ns == b[2].st_mtime_ns:
+                return None
+            va, vb, bg = a[2].st_mtime_ns, b[2].st_mtime_ns, 1
+    if same_version and tw == 'entry' and title_group(x) != title_group(y):
+        return None  # equal version, two different automatic titles: no reliable winner
+    base = dict(x if va >= vb else y)
+    if tw != 'entry':
+        src = x if tw == 'x' else y
+        for k in TITLE_FIELDS:
+            base.pop(k, None)
+        base.update(title_group(src))
+    return base, bg
+
+
 def plan(pair, only=None):
     (la, da), (lb, db) = pair
     ea, ta = load_org(da)
@@ -168,19 +217,20 @@ def plan(pair, only=None):
             if a[0] == b[0] or a[1] == b[1]:
                 c['common_identical'] += 1
                 continue
-            va, vb = version(a[1]), version(b[1])
-            if va == vb:
-                # Desktop refreshes some fields in the background without bumping the activity
-                # timestamps; for those only, the newer file wins (we never write differing content,
-                # so a newer mtime on differing content is always a Desktop write).
-                diff = {k for k in set(a[1]) | set(b[1]) if a[1].get(k) != b[1].get(k)}
-                if not diff <= BACKGROUND_FIELDS or a[2].st_mtime_ns == b[2].st_mtime_ns:
-                    conflicts.append(sid)
-                    continue
-                va, vb = a[2].st_mtime_ns, b[2].st_mtime_ns
-                c['background_refresh'] += 1
-            # newer flows to older; op = (kind, src_label, dst_label, dst_dir, sid, src, dst)
-            op = ('UPD', la, lb, db, sid, a, b) if va > vb else ('UPD', lb, la, da, sid, b, a)
+            res = merge(a, b)
+            if res is None:
+                conflicts.append(sid)
+                continue
+            merged, bg = res
+            c['background_refresh'] += bg
+            # write the merged entry to every side that differs from it (usually just the older one)
+            data = a[0] if merged == a[1] else b[0] if merged == b[1] else json.dumps(merged).encode()
+            m = (data, merged, None)
+            if a[1] != merged:
+                ops.append(('UPD', lb if merged == b[1] else 'MERGE', la, da, sid, m, a))
+            if b[1] != merged:
+                ops.append(('UPD', la if merged == a[1] else 'MERGE', lb, db, sid, m, b))
+            continue
         else:
             s = a or b
             if s[1].get('cliSessionId') not in tx:

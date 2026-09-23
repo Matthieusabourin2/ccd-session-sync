@@ -111,6 +111,38 @@ class OrgSyncTest(unittest.TestCase):
         os.utime(os.path.join(self.org(MAX), 'local_c.json'), (1, 1))
         self.assertIn('conflict', self.run_sync('sync').stderr)
 
+    def test_rename_survives_newer_activity_in_other_org(self):
+        # real case: renamed under Max (no activity bump) while Team got a newer message
+        self.put(MAX, entry('c', act=1000, focus=60, title='renamed', titleSource='user', previousTitles=['auto t']))
+        self.put(TEAM, entry('c', act=2000, focus=50, title='auto t', titleSource='auto', turns=4))
+        r = self.run_sync('sync'); self.assertEqual(r.returncode, 0, r.stderr)
+        for o in (MAX, TEAM):
+            e = self.get(o, 'c')
+            self.assertEqual((e['title'], e['titleSource'], e['lastActivityAt'], e['turns']), ('renamed', 'user', 2000, 4))
+        n = len(self.snapshots())
+        self.assertEqual(self.run_sync('sync').returncode, 0); self.assertEqual(n, len(self.snapshots()))  # stable
+
+    def test_rename_history_decides_between_two_chosen_titles(self):
+        self.put(MAX, entry('c', act=2000, title='v1', titleSource='user'))
+        self.put(TEAM, entry('c', act=1000, title='v2', titleSource='user', previousTitles=['v1']))
+        self.assertEqual(self.run_sync('sync').returncode, 0)
+        self.assertEqual(self.get(MAX, 'c')['title'], 'v2'); self.assertEqual(self.get(MAX, 'c')['lastActivityAt'], 2000)
+
+    def test_two_chosen_titles_without_history_abort(self):
+        self.put(MAX, entry('c', act=2000, title='x', titleSource='user'))
+        self.put(TEAM, entry('c', act=1000, title='y', titleSource='user'))
+        self.assertIn('conflict', self.run_sync('sync').stderr)
+
+    def test_equal_version_different_auto_titles_abort(self):
+        self.put(MAX, entry('c', title='x', titleSource='auto')); self.put(TEAM, entry('c', title='y', titleSource='auto'))
+        self.assertIn('conflict', self.run_sync('sync').stderr)
+
+    def test_newer_auto_retitle_follows_entry(self):
+        self.put(MAX, entry('c', act=2000, title='new auto', titleSource='auto'))
+        self.put(TEAM, entry('c', act=1000, title='old auto', titleSource='auto'))
+        self.assertEqual(self.run_sync('sync').returncode, 0)
+        self.assertEqual(self.get(TEAM, 'c')['title'], 'new auto')
+
     def test_invalid_json_aborts_without_writes(self):
         self.put(MAX, entry('a'))
         with open(os.path.join(self.org(TEAM), 'local_bad.json'), 'w') as f:
