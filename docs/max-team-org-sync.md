@@ -22,7 +22,7 @@ Per `sessionId` present in either org:
 1. tombstone `deleted_<uuid>` in either org → skip (never resurrect; deletions not propagated in v1)
 2. only in one org → create in the other, **if** its transcript exists and it is not a `scheduledTaskId` run
 3. identical bytes or identical JSON → nothing
-4. the **title group** (`title`, `titleSource`, `titleTurn`, `previousTitles`) is merged on its own, because a rename does not bump `lastActivityAt`: the side whose `previousTitles` contains the other side's title wins; else a chosen title (`user`/`tool`) beats an automatic one; two different chosen titles without history → ABORT
+4. the **title group** (`title`, `titleSource`, `titleTurn`, `previousTitles`) is merged on its own, because a rename does not bump `lastActivityAt`: the side whose `previousTitles` contains the other side's title wins (if both do — a rename was undone — the history that strictly extends the other wins, else ABORT); else a chosen title (`user`/`tool`) beats an automatic one; two different chosen titles without history → ABORT
 5. rest of the entry: version `(lastActivityAt, lastFocusedAt|0)` differs → newer wins; the merged entry is written to every side that differs from it
 6. equal version, only `BACKGROUND_FIELDS` (`prs`, `prState`, `prNumber`, `prUrl`, `prRepository`) differ → newer file mtime wins
 7. anything else (incl. two different automatic titles at equal version) → **ABORT** the whole run, write `BLOCKED`, one notification
@@ -37,9 +37,9 @@ Keychain, cookies.
 - **Schema guard**: every `local_*.json` must parse, have `sessionId == filename`, int `lastActivityAt`, str `cwd` — else no writes.
 - **Quiet gate**: waits until nothing in either org dir nor `config.json` / `mcp-user-tool-toggles.json` / `plan-usage-history.json` changed for 15 s (max 120 s wait, then retries on next trigger).
 - **Atomic + compare-and-swap**: hidden temp `.ccdsync-*.tmp` → fsync → sha check → re-stat destination (mtime_ns, size) → `os.replace`.
-- **Mass-write guard**: a real run aborts if either org has 0 entries or would create more than 25 entries (`--allow-bulk` to override after reviewing a dry-run).
+- **Mass-write guard**: a real run aborts if either org has 0 entries (fill a brand-new org with `--only <sessionId>`), or would create more than 25 entries (`--allow-bulk` overrides this one after reviewing a dry-run).
 - **Lock**: sync and rollback share an `flock`; `BLOCKED` is re-checked after the quiet wait, and rollback sets it *before* restoring.
-- **Snapshot per writing run**: `~/.claude/ccd-session-sync-backups/<ts>/manifest.json` (timestamp, Desktop version, source/destination space, path, sha256 before/after) + byte copies of overwritten files. Only `done` snapshots are pruned (last 50 kept); `in-progress` (crashed) and `rolled-back` ones are kept forever.
+- **Snapshot per writing run**: `~/.claude/ccd-session-sync-backups/<ts>/manifest.json` (timestamp, Desktop version, source/destination space, path, sha256 before/after) + byte copies of overwritten files. Only `done` snapshots and `aborted` ones that wrote nothing are pruned (last 200 kept); `in-progress` (crashed), partially applied, `rolled-back` and `PINNED` ones are kept.
 - **Logs** (`sync.log`): counts, snapshot id, result. No titles, no content.
 
 ## Commands

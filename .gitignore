@@ -9,3 +9,4 @@ last-owner
 # rendered (host-specific) plists — only the .template files are tracked
 launchagents/*.plist
 .DS_Store
+__pycache__/

@@ -21,7 +21,7 @@ PROJECTS = os.environ.get('CCD_PROJECTS_DIR', os.path.expanduser('~/.claude/proj
 BK = os.environ.get('CCD_BACKUP_DIR', os.path.expanduser('~/.claude/ccd-session-sync-backups'))
 QUIET = float(os.environ.get('CCD_QUIET_SECONDS', '15'))
 QUIET_MAX_WAIT = float(os.environ.get('CCD_QUIET_MAX_WAIT', '180'))
-KEEP = int(os.environ.get('CCD_KEEP_SNAPSHOTS', '50'))
+KEEP = int(os.environ.get('CCD_KEEP_SNAPSHOTS', '200'))
 MAX_CREATE = int(os.environ.get('CCD_MAX_CREATE', '25'))
 CCS = os.path.join(ROOT, 'claude-code-sessions')
 BLOCKED = os.path.join(BK, 'BLOCKED')
@@ -156,10 +156,16 @@ def title_winner(x, y):
     """which entry's title group is the latest intent: 'x', 'y', 'entry' (no preference) or None."""
     if title_group(x) == title_group(y):
         return 'entry'
-    if x.get('title') in (y.get('previousTitles') or []):
-        return 'y'                      # y was renamed from x's title
-    if y.get('title') in (x.get('previousTitles') or []):
-        return 'x'
+    px, py = x.get('previousTitles') or [], y.get('previousTitles') or []
+    xy, yx = x.get('title') in py, y.get('title') in px   # "y was renamed from x's title", and vice versa
+    if xy and yx:  # both histories cite the other (a rename was undone): the longer, extending history wins
+        if len(py) > len(px) and py[:len(px)] == px:
+            return 'y'
+        if len(px) > len(py) and px[:len(py)] == py:
+            return 'x'
+        return None
+    if xy or yx:
+        return 'y' if xy else 'x'
     ux, uy = x.get('titleSource') in HUMAN_TITLE, y.get('titleSource') in HUMAN_TITLE
     if ux != uy:
         return 'x' if ux else 'y'       # a chosen title beats an automatic one
@@ -250,10 +256,12 @@ def plan(pair, only=None):
              f'{la}_only': len(set(ea) - set(eb)), f'{lb}_only': len(set(eb) - set(ea)),
              'conflicts': len(conflicts), **c, 'to_create': sum(o[0] == 'NEW' for o in ops),
              'to_update': sum(o[0] == 'UPD' for o in ops), 'categories_of_writes': cat}
-    return ops, conflicts, stats
+    ids_w = {o[4] for o in ops}
+    seen = {os.path.join(d, sid + '.json'): e[sid][2] for d, e in ((da, ea), (db, eb)) for sid in ids_w if sid in e}
+    return ops, conflicts, stats, seen
 
 
-def apply(ops, pair):
+def apply(ops, pair, seen):
     ts = time.strftime('%Y%m%d-%H%M%S') + f'-{os.getpid()}'
     snap = os.path.join(BK, ts)
     os.makedirs(os.path.join(snap, 'files'))
@@ -272,6 +280,25 @@ def apply(ops, pair):
         man['ops'].append(rec)
     write_manifest(snap, man)
     crash_after = int(os.environ.get('CCD_TEST_CRASH_AFTER', '-1'))
+    if os.environ.get('CCD_TEST_TOUCH_BEFORE_APPLY'):  # test hook: Desktop writes the source meanwhile
+        p0 = next(iter(seen)); os.utime(p0, ns=(time.time_ns() + 10**9, time.time_ns() + 10**9))
+    try:
+        for p, st in seen.items():  # nothing we read (source or destination) may have moved since
+            now = os.stat(p) if os.path.exists(p) else None
+            if now is None or (now.st_mtime_ns, now.st_size) != (st.st_mtime_ns, st.st_size):
+                raise Abort(f'{os.path.basename(p)[:20]} changed during sync')
+        _apply_ops(ops, man, crash_after)
+    except Abort:
+        man['status'], man['applied'] = 'aborted', man.get('applied', 0)
+        write_manifest(snap, man)
+        raise
+    man['status'] = 'done'
+    write_manifest(snap, man)
+    prune()
+    return ts
+
+
+def _apply_ops(ops, man, crash_after):
     done = 0
     for (kind, sl, dl, ddir, sid, s, d), rec in zip(ops, man['ops']):
         dst = rec['path']
@@ -285,12 +312,10 @@ def apply(ops, pair):
                 raise Abort(f'{sid[:14]} changed in {dl} during sync')
         atomic_write(dst, s[0], rec['sha256_after'])
         done += 1
+        man['applied'] = done
         if done == crash_after:
             os._exit(9)  # test hook: simulate a kill mid-run
-    man['status'] = 'done'
-    write_manifest(snap, man)
-    prune()
-    return ts
+    return done
 
 
 def atomic_write(dst, data, expect_sha):
@@ -316,14 +341,15 @@ def write_manifest(snap, man):
 
 
 def prune():
-    """only completed, unpinned snapshots are pruned; in-progress / rolled-back / pinned are kept."""
+    """prune completed and no-op aborted snapshots; in-progress / partial / rolled-back / pinned are kept."""
     done = []
     for d in sorted(os.listdir(BK)):
         m = os.path.join(BK, d, 'manifest.json')
         if os.path.exists(os.path.join(BK, d, 'PINNED')):  # e.g. the initial bulk migration
             continue
         try:
-            if json.load(open(m)).get('status') == 'done':
+            mf = json.load(open(m))
+            if mf.get('status') == 'done' or (mf.get('status') == 'aborted' and not mf.get('applied')):
                 done.append(d)
         except (OSError, ValueError):
             pass
@@ -353,7 +379,7 @@ def cmd_sync(args, pair):
         lock()
         wait_quiet(pair)
         check_blocked()  # a rollback/abort may have happened while we waited
-    ops, conflicts, stats = plan(pair, only)
+    ops, conflicts, stats, seen = plan(pair, only)
     print(json.dumps(stats, indent=1))
     if '--verbose' in args:
         for kind, sl, dl, _, sid, s, _ in ops:
@@ -382,7 +408,7 @@ def cmd_sync(args, pair):
         return
     if not ops:
         return
-    ts = apply(ops, pair)
+    ts = apply(ops, pair, seen)
     log(f'sync snapshot={ts} created={stats["to_create"]} updated={stats["to_update"]} result=ok')
     print(f'snapshot {ts}: created={stats["to_create"]} updated={stats["to_update"]}')
 

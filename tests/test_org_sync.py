@@ -106,8 +106,8 @@ class OrgSyncTest(unittest.TestCase):
         self.assertEqual(self.get(MAX, 'c')['prs'], [{'state': 'MERGED'}])
 
     def test_background_field_plus_other_field_still_aborts(self):
-        self.put(MAX, entry('c', prs=[1], title='x'))
-        self.put(TEAM, entry('c', prs=[2], title='y'))
+        self.put(MAX, entry('c', prs=[1], cwd='/p/x'))
+        self.put(TEAM, entry('c', prs=[2], cwd='/p/y'))
         os.utime(os.path.join(self.org(MAX), 'local_c.json'), (1, 1))
         self.assertIn('conflict', self.run_sync('sync').stderr)
 
@@ -289,6 +289,12 @@ class OrgSyncTest(unittest.TestCase):
             self.run_sync('sync', CCD_KEEP_SNAPSHOTS='1')
         self.assertIn(crashed, self.snapshots())
         self.assertEqual(len(self.snapshots()), 2)                # crashed + newest done
+        rb = self.snapshots()[-1]
+        self.assertEqual(self.run_sync('rollback', rb).returncode, 0); self.run_sync('unblock')
+        for i in range(2):
+            self.put(MAX, entry(f'y{i}'))
+            self.run_sync('sync', CCD_KEEP_SNAPSHOTS='1')
+        self.assertIn(rb, self.snapshots()); self.assertIn(crashed, self.snapshots())
 
     def test_prune_keeps_pinned(self):
         self.put(TEAM, entry('t0')); self.put(MAX, entry('a'))
@@ -299,6 +305,30 @@ class OrgSyncTest(unittest.TestCase):
             self.put(MAX, entry(f'x{i}'))
             self.run_sync('sync', CCD_KEEP_SNAPSHOTS='1')
         self.assertIn(pinned, self.snapshots())
+        self.assertEqual(len(self.snapshots()), 2)                # pinned + newest done; 2 pruned
+
+    def test_undone_rename_wins_in_either_orientation(self):
+        for first, second in ((MAX, TEAM), (TEAM, MAX)):
+            self.setUp()
+            self.put(first, entry('c', act=5, title='A', titleSource='user', previousTitles=['A', 'B']))
+            self.put(second, entry('c', act=5, title='B', titleSource='user', previousTitles=['A']))
+            r = self.run_sync('sync'); self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual((self.get(MAX, 'c')['title'], self.get(TEAM, 'c')['title']), ('A', 'A'))
+
+    def test_divergent_rename_histories_abort(self):
+        self.put(MAX, entry('c', title='A', titleSource='user', previousTitles=['B', 'X']))
+        self.put(TEAM, entry('c', title='B', titleSource='user', previousTitles=['A', 'Y']))
+        self.assertIn('conflict', self.run_sync('sync').stderr)
+
+    def test_noop_aborted_snapshot_is_pruned(self):
+        self.put(TEAM, entry('t0')); self.put(MAX, entry('a'))
+        r = self.run_sync('sync', CCD_TEST_TOUCH_BEFORE_APPLY='1')
+        self.assertIn('changed during sync', r.stderr)
+        man = json.load(open(os.path.join(self.bk, self.snapshots()[0], 'manifest.json')))
+        self.assertEqual((man['status'], man['applied']), ('aborted', 0))
+        self.put(MAX, entry('b')); self.run_sync('sync', CCD_KEEP_SNAPSHOTS='1')
+        self.put(MAX, entry('d')); self.run_sync('sync', CCD_KEEP_SNAPSHOTS='1')
+        self.assertEqual(len(self.snapshots()), 1)
 
     def test_rollback_rejects_path_traversal(self):
         self.assertIn('invalid snapshot', self.run_sync('rollback', '../x').stderr)
