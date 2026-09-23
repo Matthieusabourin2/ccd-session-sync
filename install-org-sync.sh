@@ -22,11 +22,11 @@ for d in "$A" "$B"; do [ -d "$CCS/$d" ] || { echo "ERROR: $CCS/$d not found" >&2
 
 mkdir -p "$BIN" "$LA" "$BACKUPS"
 cp "$REPO_SRC/bin/ccd-org-sync" "$BIN/ccd-org-sync"; chmod +x "$BIN/ccd-org-sync"
-CCD_PAIR="$PAIR" python3 "$BIN/ccd-org-sync" sync --dry-run >/dev/null   # fail closed before loading the agent
+CCD_PAIR="$PAIR" /usr/bin/python3 "$BIN/ccd-org-sync" sync --dry-run >/dev/null   # fail closed before loading the agent
 sed -e "s#__BIN__#$BIN#g" -e "s#__PAIR__#$PAIR#g" -e "s#__ORG_A__#$CCS/$A#g" \
     -e "s#__ORG_B__#$CCS/$B#g" -e "s#__BACKUPS__#$BACKUPS#g" \
     "$REPO_SRC/launchagents/$LABEL.plist.template" > "$LA/$LABEL.plist"
 plutil -lint "$LA/$LABEL.plist" >/dev/null
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null && sleep 2 || true
 launchctl bootstrap "gui/$(id -u)" "$LA/$LABEL.plist"
 echo "installed: $BIN/ccd-org-sync + $LABEL (log: $BACKUPS/sync.log)"

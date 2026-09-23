@@ -22,7 +22,7 @@ Per `sessionId` present in either org:
 2. only in one org → create in the other, **if** its transcript exists and it is not a `scheduledTaskId` run
 3. identical bytes or identical JSON → nothing
 4. version `(lastActivityAt, lastFocusedAt|0)` differs → newer overwrites older
-5. equal version, only `BACKGROUND_FIELDS` (`prs`) differ → newer file mtime wins
+5. equal version, only `BACKGROUND_FIELDS` (`prs`, `prState`, `prNumber`, `prUrl`, `prRepository`) differ → newer file mtime wins
 6. anything else → **ABORT** the whole run, write `BLOCKED`, one notification
 
 Never touched: `~/.claude/projects`, `scheduled-tasks.json`, `backlog/`, `archived-sessions.idx`,
@@ -35,7 +35,9 @@ Keychain, cookies.
 - **Schema guard**: every `local_*.json` must parse, have `sessionId == filename`, int `lastActivityAt`, str `cwd` — else no writes.
 - **Quiet gate**: waits until nothing in either org dir nor `config.json` / `mcp-user-tool-toggles.json` / `plan-usage-history.json` changed for 15 s (max 120 s wait, then retries on next trigger).
 - **Atomic + compare-and-swap**: hidden temp `.ccdsync-*.tmp` → fsync → sha check → re-stat destination (mtime_ns, size) → `os.replace`.
-- **Snapshot per writing run**: `~/.claude/ccd-session-sync-backups/<ts>/manifest.json` (timestamp, Desktop version, source/destination space, path, sha256 before/after) + byte copies of overwritten files. Last 50 kept.
+- **Mass-write guard**: a real run aborts if either org has 0 entries or would create more than 25 entries (`--allow-bulk` to override after reviewing a dry-run).
+- **Lock**: sync and rollback share an `flock`; `BLOCKED` is re-checked after the quiet wait, and rollback sets it *before* restoring.
+- **Snapshot per writing run**: `~/.claude/ccd-session-sync-backups/<ts>/manifest.json` (timestamp, Desktop version, source/destination space, path, sha256 before/after) + byte copies of overwritten files. Only `done` snapshots are pruned (last 50 kept); `in-progress` (crashed) and `rolled-back` ones are kept forever.
 - **Logs** (`sync.log`): counts, snapshot id, result. No titles, no content.
 
 ## Commands
@@ -58,6 +60,12 @@ ccd-org-sync unblock                      # resume after a conflict or rollback
 - If you switch org less than ~15 s after the last activity, the newest metadata (title, turn count, a brand-new session) lands after the switch and shows on the next switch. Transcript content is unaffected: it is read directly from the shared `.jsonl`.
 - Internal, undocumented format: a Desktop update that changes the schema makes the tool refuse to write (fail closed) — check `sync.log`.
 - The initial bulk migration was run with Desktop fully quit; steady-state runs write while Desktop runs, mostly into the inactive org.
+
+- Not yet verified: when a newer entry lands in the org that is **active** at that moment (switch within the quiet window), Desktop may keep its stale in-memory copy and re-write it on the next focus; only metadata could regress, never the transcript.
+- `archived-sessions.idx` is per org and not synced; archive state is carried by the entry's `isArchived` flag only.
+- Deleting a session in one org is not propagated; the copy in the other org stays (not resurrected where a tombstone exists).
+- If activity favours one side and focus the other, the side with the newer `lastActivityAt` wins.
+- `sync.log` / `launchd.log` are not rotated (a few lines per run).
 
 ## Uninstall
 ```bash

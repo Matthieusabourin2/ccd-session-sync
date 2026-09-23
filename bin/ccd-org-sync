@@ -8,13 +8,13 @@ Transcripts live org-agnostically in ~/.claude/projects and are never touched he
 Observed (Desktop 2.7032): the app re-reads the index on every org switch and only writes the
 ACTIVE org's dir, so merging entries into the other dir makes them appear on the next switch.
 
-  ccd-org-sync sync [--dry-run] [--only <sessionId>] [--verbose]
+  ccd-org-sync sync [--dry-run] [--only <sessionId>] [--verbose] [--allow-bulk]
   ccd-org-sync status
   ccd-org-sync rollback <snapshot-ts>
   ccd-org-sync unblock
 Pair (required): CCD_PAIR="MAX=<acct>/<org>,TEAM=<acct>/<org>"  (or --pair)
 """
-import glob, hashlib, json, os, shutil, subprocess, sys, time
+import fcntl, glob, hashlib, json, os, re, shutil, subprocess, sys, time
 
 ROOT = os.environ.get('CCD_CLAUDE_DIR', os.path.expanduser('~/Library/Application Support/Claude'))
 PROJECTS = os.environ.get('CCD_PROJECTS_DIR', os.path.expanduser('~/.claude/projects'))
@@ -22,6 +22,7 @@ BK = os.environ.get('CCD_BACKUP_DIR', os.path.expanduser('~/.claude/ccd-session-
 QUIET = float(os.environ.get('CCD_QUIET_SECONDS', '15'))
 QUIET_MAX_WAIT = float(os.environ.get('CCD_QUIET_MAX_WAIT', '180'))
 KEEP = int(os.environ.get('CCD_KEEP_SNAPSHOTS', '50'))
+MAX_CREATE = int(os.environ.get('CCD_MAX_CREATE', '25'))
 CCS = os.path.join(ROOT, 'claude-code-sessions')
 BLOCKED = os.path.join(BK, 'BLOCKED')
 LOG = os.path.join(BK, 'sync.log')
@@ -29,10 +30,14 @@ LOG = os.path.join(BK, 'sync.log')
 BUSY_FILES = ['config.json', 'mcp-user-tool-toggles.json', 'plan-usage-history.json']
 # entry fields Desktop rewrites in the background without touching lastActivityAt/lastFocusedAt
 # (observed 2.7032: PR status refresh). Anything else differing at equal version -> ABORT.
-BACKGROUND_FIELDS = {'prs'}
+BACKGROUND_FIELDS = {'prs', 'prState', 'prNumber', 'prUrl', 'prRepository'}
 
 
 class Abort(Exception):
+    pass
+
+
+class Blocked(Abort):
     pass
 
 
@@ -212,7 +217,7 @@ def apply(ops, pair):
             bpath = os.path.join(snap, 'files', dl, sid + '.json')
             os.makedirs(os.path.dirname(bpath), exist_ok=True)
             with open(bpath, 'wb') as f:
-                f.write(d[0])
+                f.write(d[0]); f.flush(); os.fsync(f.fileno())
             rec['backup'] = os.path.relpath(bpath, snap)
         man['ops'].append(rec)
     write_manifest(snap, man)
@@ -220,20 +225,15 @@ def apply(ops, pair):
     done = 0
     for (kind, sl, dl, ddir, sid, s, d), rec in zip(ops, man['ops']):
         dst = rec['path']
-        tmp = os.path.join(ddir, f'.ccdsync-{os.getpid()}-{done}.tmp')
-        with open(tmp, 'wb') as f:
-            f.write(s[0]); f.flush(); os.fsync(f.fileno())
-        if sha(open(tmp, 'rb').read()) != rec['sha256_after']:
-            os.unlink(tmp); raise Abort('temp file verification failed')
         # compare-and-swap: the destination must still be exactly what we planned against
         if d is None:
             if os.path.exists(dst):
-                os.unlink(tmp); raise Abort(f'{sid[:14]} appeared in {dl} during sync')
+                raise Abort(f'{sid[:14]} appeared in {dl} during sync')
         else:
-            st = os.stat(dst)
-            if (st.st_mtime_ns, st.st_size) != (d[2].st_mtime_ns, d[2].st_size):
-                os.unlink(tmp); raise Abort(f'{sid[:14]} changed in {dl} during sync')
-        os.replace(tmp, dst)
+            st = os.stat(dst) if os.path.exists(dst) else None
+            if st is None or (st.st_mtime_ns, st.st_size) != (d[2].st_mtime_ns, d[2].st_size):
+                raise Abort(f'{sid[:14]} changed in {dl} during sync')
+        atomic_write(dst, s[0], rec['sha256_after'])
         done += 1
         if done == crash_after:
             os._exit(9)  # test hook: simulate a kill mid-run
@@ -241,6 +241,20 @@ def apply(ops, pair):
     write_manifest(snap, man)
     prune()
     return ts
+
+
+def atomic_write(dst, data, expect_sha):
+    """hidden temp in the same dir -> fsync -> verify -> rename; the temp never survives."""
+    tmp = os.path.join(os.path.dirname(dst), f'.ccdsync-{os.getpid()}-{time.monotonic_ns()}.tmp')
+    try:
+        with open(tmp, 'wb') as f:
+            f.write(data); f.flush(); os.fsync(f.fileno())
+        if sha(open(tmp, 'rb').read()) != expect_sha:
+            raise Abort('temp file verification failed')
+        os.replace(tmp, dst)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def write_manifest(snap, man):
@@ -252,19 +266,41 @@ def write_manifest(snap, man):
 
 
 def prune():
-    snaps = sorted(d for d in os.listdir(BK) if os.path.isfile(os.path.join(BK, d, 'manifest.json')))
-    for d in snaps[:-KEEP]:
+    """only completed snapshots are pruned; in-progress / rolled-back ones are kept forever."""
+    done = []
+    for d in sorted(os.listdir(BK)):
+        m = os.path.join(BK, d, 'manifest.json')
+        try:
+            if json.load(open(m)).get('status') == 'done':
+                done.append(d)
+        except (OSError, ValueError):
+            pass
+    for d in done[:-KEEP]:
         shutil.rmtree(os.path.join(BK, d))
+
+
+def lock():
+    """one sync or rollback at a time (held until the process exits)."""
+    fd = os.open(os.path.join(BK, 'lock'), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def check_blocked():
+    if os.path.exists(BLOCKED):
+        raise Blocked(f'blocked ({open(BLOCKED).read().strip()}) — fix, then `ccd-org-sync unblock`')
 
 
 def cmd_sync(args, pair):
     dry = '--dry-run' in args
     only = args[args.index('--only') + 1] if '--only' in args else None
-    if os.path.exists(BLOCKED) and not dry:
-        raise Abort(f'blocked since a previous abort ({open(BLOCKED).read().strip()}) — fix, then `ccd-org-sync unblock`')
+    if not dry:
+        check_blocked()
     check_owner(pair)
     if not dry:
+        lock()
         wait_quiet(pair)
+        check_blocked()  # a rollback/abort may have happened while we waited
     ops, conflicts, stats = plan(pair, only)
     print(json.dumps(stats, indent=1))
     if '--verbose' in args:
@@ -279,6 +315,16 @@ def cmd_sync(args, pair):
                 f.write(msg)
             notify('ccd-org-sync: BLOCKED', msg)
         raise Abort(msg)
+    (la, _), (lb, _) = pair
+    guards = []
+    if not only and (stats[la] == 0 or stats[lb] == 0):
+        guards.append(f'one side is empty ({la}={stats[la]}, {lb}={stats[lb]}) — wrong pair or unknown format')
+    if stats['to_create'] > MAX_CREATE and '--allow-bulk' not in args:
+        guards.append(f'{stats["to_create"]} creations > cap {MAX_CREATE} — review this dry-run, then sync --allow-bulk')
+    if guards and not dry:
+        raise Abort('; '.join(guards))
+    for g in guards:
+        print(f'WARNING (a real run would abort): {g}')
     if dry:
         print('DRY RUN — NO FILES MODIFIED')
         return
@@ -290,34 +336,49 @@ def cmd_sync(args, pair):
 
 
 def cmd_rollback(ts):
+    if os.path.basename(ts) != ts or ts.startswith('.'):
+        raise Abort('invalid snapshot name')
     snap = os.path.join(BK, ts)
     man = json.load(open(os.path.join(snap, 'manifest.json')))
+    pair = [(l, os.path.join(CCS, rel)) for l, rel in man['pair'].items()]
+    dirs = {d for _, d in pair}
+    for r in man['ops']:
+        if os.path.dirname(r['path']) not in dirs or not re.fullmatch(r'local_[0-9a-zA-Z-]+\.json',
+                                                                        os.path.basename(r['path'])):
+            raise Abort('manifest path outside the paired index dirs — rollback refused')
+    lock()
+    with open(BLOCKED, 'w') as f:  # first: no sync may re-apply what we are undoing
+        f.write(f'rolling back {ts}')
+    wait_quiet(pair)
     todo = []
     for r in man['ops']:  # classify by current bytes (works after a crash mid-run too)
-        cur = sha(open(r['path'], 'rb').read()) if os.path.exists(r['path']) else None
+        cur = file_sha(r['path'])
         if cur == r['sha256_after']:
             todo.append(r)                      # applied -> revert
         elif cur != r['sha256_before']:         # neither ours nor the original: changed since
             raise Abort(f'{os.path.basename(r["path"])[:20]} changed since snapshot {ts} — rollback refused')
+    for r in todo:
+        if r['op'] == 'UPD' and sha(open(os.path.join(snap, r['backup']), 'rb').read()) != r['sha256_before']:
+            raise Abort(f'backup of {os.path.basename(r["path"])[:20]} is corrupt — rollback refused, nothing written')
     parked = os.path.join(snap, 'rolled-back-created')
     for r in todo:
+        if file_sha(r['path']) != r['sha256_after']:  # re-check right before each write
+            raise Abort(f'{os.path.basename(r["path"])[:20]} changed during rollback — stopped')
         if r['op'] == 'UPD':
-            data = open(os.path.join(snap, r['backup']), 'rb').read()
-            tmp = r['path'] + '.ccdrb.tmp'
-            with open(tmp, 'wb') as f:
-                f.write(data); f.flush(); os.fsync(f.fileno())
-            os.replace(tmp, r['path'])
-            if sha(open(r['path'], 'rb').read()) != r['sha256_before']:
-                raise Abort(f'restore verification failed for {r["path"]}')
+            atomic_write(r['path'], open(os.path.join(snap, r['backup']), 'rb').read(), r['sha256_before'])
         else:  # created by us: move aside into the snapshot, never delete
             os.makedirs(parked, exist_ok=True)
             shutil.move(r['path'], os.path.join(parked, os.path.basename(r['path'])))
     man['status'] = 'rolled-back'
     write_manifest(snap, man)
-    with open(BLOCKED, 'w') as f:  # keep the watcher from immediately re-applying it
+    with open(BLOCKED, 'w') as f:
         f.write(f'rolled back {ts}')
     log(f'rollback snapshot={ts} files={len(todo)} result=ok (sync now blocked; `unblock` to resume)')
     print(f'rolled back {len(todo)} file(s); sync blocked until `ccd-org-sync unblock`')
+
+
+def file_sha(p):
+    return sha(open(p, 'rb').read()) if os.path.exists(p) else None
 
 
 def cmd_status(pair):
@@ -351,9 +412,16 @@ def main(argv):
         if cmd == 'status':
             cmd_status(pair); return 0
         print(f'unknown command {cmd}', file=sys.stderr); return 2
+    except Blocked as e:  # already notified/logged once; stay quiet on every trigger
+        print(f'ABORT: {e}', file=sys.stderr)
+        return 1
     except Abort as e:
         log(f'{cmd} ABORT {e}')
         print(f'ABORT: {e}', file=sys.stderr)
+        return 1
+    except Exception as e:  # unexpected (e.g. a file vanished): fail closed, log the type only
+        log(f'{cmd} ERROR {type(e).__name__}')
+        print(f'ERROR: {type(e).__name__}', file=sys.stderr)
         return 1
 
 

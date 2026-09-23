@@ -1,5 +1,5 @@
 """End-to-end tests for bin/ccd-org-sync against a fake Claude Desktop tree (python3 -m unittest)."""
-import glob, hashlib, json, os, subprocess, tempfile, unittest
+import glob, hashlib, json, os, subprocess, tempfile, time, unittest
 
 SCRIPT = os.path.join(os.path.dirname(__file__), '..', 'bin', 'ccd-org-sync')
 ACCT = '11111111-0000-0000-0000-000000000000'
@@ -134,18 +134,18 @@ class OrgSyncTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.bk) and self.snapshots())
 
     def test_tombstone_never_resurrected(self):
-        self.put(MAX, entry('d'))
+        self.put(MAX, entry('d')); self.put(TEAM, entry('t0'))
         open(os.path.join(self.org(TEAM), 'deleted_d'), 'w').write('123')
         self.assertEqual(self.run_sync('sync').returncode, 0)
         self.assertIsNone(self.get(TEAM, 'd'))
 
     def test_dead_transcript_skipped(self):
-        self.put(MAX, entry('z'), transcript=False)
+        self.put(MAX, entry('z'), transcript=False); self.put(TEAM, entry('t0'))
         r = self.run_sync('sync'); self.assertIn('"dead_skipped": 1', r.stdout)
         self.assertIsNone(self.get(TEAM, 'z'))
 
     def test_scheduled_task_runs_not_copied(self):
-        self.put(MAX, entry('s', scheduledTaskId='task-1'))
+        self.put(MAX, entry('s', scheduledTaskId='task-1')); self.put(TEAM, entry('t0'))
         r = self.run_sync('sync'); self.assertIn('"scheduled_task_skipped": 1', r.stdout)
         self.assertIsNone(self.get(TEAM, 's'))
 
@@ -210,6 +210,56 @@ class OrgSyncTest(unittest.TestCase):
         r = self.run_sync('sync'); self.assertEqual(r.returncode, 0)
         self.assertEqual(n, len(self.snapshots()))
         self.assertEqual([], glob.glob(os.path.join(self.root, '**', '.ccdsync-*'), recursive=True))
+
+    # --- review follow-ups ---------------------------------------------------------------------
+    def test_empty_side_refuses(self):
+        self.put(MAX, entry('a'))
+        r = self.run_sync('sync'); self.assertIn('one side is empty', r.stderr)
+        self.assertIsNone(self.get(TEAM, 'a'))
+
+    def test_bulk_creation_cap(self):
+        self.put(TEAM, entry('t0'))
+        for i in range(4):
+            self.put(MAX, entry(f'm{i}'))
+        r = self.run_sync('sync', CCD_MAX_CREATE='3'); self.assertIn('cap 3', r.stderr)
+        self.assertIsNone(self.get(TEAM, 'm0'))
+        self.assertEqual(self.run_sync('sync', '--allow-bulk', CCD_MAX_CREATE='3').returncode, 0)
+        self.assertIsNotNone(self.get(TEAM, 'm3'))
+
+    def test_rollback_refuses_corrupt_backup_without_writing(self):
+        self.put(MAX, entry('c', act=9, title='new')); self.put(TEAM, entry('c', act=1, title='old'))
+        self.run_sync('sync')
+        ts = self.snapshots()[0]
+        b = glob.glob(os.path.join(self.bk, ts, 'files', '*', '*.json'))[0]
+        open(b, 'w').write('GARBAGE')
+        r = self.run_sync('rollback', ts); self.assertIn('corrupt', r.stderr)
+        self.assertEqual(self.get(TEAM, 'c')['title'], 'new')
+
+    def test_block_set_while_sync_waits_prevents_write(self):
+        self.put(MAX, entry('a')); self.put(TEAM, entry('t0'))
+        e = dict(os.environ, CCD_CLAUDE_DIR=self.root, CCD_PROJECTS_DIR=os.path.dirname(self.proj),
+                 CCD_BACKUP_DIR=self.bk, CCD_QUIET_SECONDS='2', CCD_NO_NOTIFY='1',
+                 CCD_PAIR=f'MAX={MAX},TEAM={TEAM}')
+        p = subprocess.Popen(['python3', SCRIPT, 'sync'], env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(0.8)
+        open(os.path.join(self.bk, 'BLOCKED'), 'w').write('rolling back x')
+        _, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 1); self.assertIn('blocked', err)
+        self.assertIsNone(self.get(TEAM, 'a'))
+
+    def test_prune_keeps_in_progress_and_rolled_back(self):
+        self.put(TEAM, entry('t0'))
+        self.put(MAX, entry('a')); self.put(MAX, entry('b'))
+        self.run_sync('sync', CCD_TEST_CRASH_AFTER='1')           # leaves an in-progress snapshot
+        crashed = self.snapshots()[0]
+        for i in range(3):
+            self.put(MAX, entry(f'x{i}'))
+            self.run_sync('sync', CCD_KEEP_SNAPSHOTS='1')
+        self.assertIn(crashed, self.snapshots())
+        self.assertEqual(len(self.snapshots()), 2)                # crashed + newest done
+
+    def test_rollback_rejects_path_traversal(self):
+        self.assertIn('invalid snapshot', self.run_sync('rollback', '../x').stderr)
 
 
 if __name__ == '__main__':
