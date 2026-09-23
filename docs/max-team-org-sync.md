@@ -70,4 +70,4 @@ ccd-org-sync unblock                      # resume after a conflict or rollback
 ```bash
 ./install-org-sync.sh --uninstall     # removes agent + ~/bin/ccd-org-sync, keeps snapshots
 ```
-Entries already merged stay; roll them back with `ccd-org-sync rollback <ts>` (bulk migration snapshot) if wanted.
+Entries already merged stay. `rollback <ts>` is meant for undoing a recent run: it refuses as soon as a synced entry has changed since (every open/focus changes one). The initial bulk migration snapshot is marked `PINNED` (never pruned): its manifest lists every entry created by the migration (`op: NEW`), which is the reference if you ever want to remove those copies by hand.

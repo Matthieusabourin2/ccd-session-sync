@@ -258,6 +258,16 @@ class OrgSyncTest(unittest.TestCase):
         self.assertIn(crashed, self.snapshots())
         self.assertEqual(len(self.snapshots()), 2)                # crashed + newest done
 
+    def test_prune_keeps_pinned(self):
+        self.put(TEAM, entry('t0')); self.put(MAX, entry('a'))
+        self.run_sync('sync')
+        pinned = self.snapshots()[0]
+        open(os.path.join(self.bk, pinned, 'PINNED'), 'w').close()
+        for i in range(3):
+            self.put(MAX, entry(f'x{i}'))
+            self.run_sync('sync', CCD_KEEP_SNAPSHOTS='1')
+        self.assertIn(pinned, self.snapshots())
+
     def test_rollback_rejects_path_traversal(self):
         self.assertIn('invalid snapshot', self.run_sync('rollback', '../x').stderr)
 

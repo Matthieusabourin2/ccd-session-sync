@@ -266,10 +266,12 @@ def write_manifest(snap, man):
 
 
 def prune():
-    """only completed snapshots are pruned; in-progress / rolled-back ones are kept forever."""
+    """only completed, unpinned snapshots are pruned; in-progress / rolled-back / pinned are kept."""
     done = []
     for d in sorted(os.listdir(BK)):
         m = os.path.join(BK, d, 'manifest.json')
+        if os.path.exists(os.path.join(BK, d, 'PINNED')):  # e.g. the initial bulk migration
+            continue
         try:
             if json.load(open(m)).get('status') == 'done':
                 done.append(d)
