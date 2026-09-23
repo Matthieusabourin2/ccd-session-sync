@@ -12,6 +12,7 @@
 | Activation rewrites ~11 entries with identical content (mtime only) | per-field diff watcher (`fields=[]`) |
 | Opening a session regenerates org-bound fields (`remoteMcpServersConfig`…) | per-field diff watcher |
 | `prs` is refreshed in the background without bumping timestamps | first real conflict, field-level diff |
+| A rename sets `titleSource=user` and pushes the old title to `previousTitles`, without bumping `lastActivityAt` | live rename test (the rename was first lost, then fixed) |
 | `ownerAccountId` / `spaces-present` do **not** change on an org switch | before/after diff → upstream `ccd-migrate-auto` never fires here |
 
 ## Merge rules
@@ -21,9 +22,10 @@ Per `sessionId` present in either org:
 1. tombstone `deleted_<uuid>` in either org → skip (never resurrect; deletions not propagated in v1)
 2. only in one org → create in the other, **if** its transcript exists and it is not a `scheduledTaskId` run
 3. identical bytes or identical JSON → nothing
-4. version `(lastActivityAt, lastFocusedAt|0)` differs → newer overwrites older
-5. equal version, only `BACKGROUND_FIELDS` (`prs`, `prState`, `prNumber`, `prUrl`, `prRepository`) differ → newer file mtime wins
-6. anything else → **ABORT** the whole run, write `BLOCKED`, one notification
+4. the **title group** (`title`, `titleSource`, `titleTurn`, `previousTitles`) is merged on its own, because a rename does not bump `lastActivityAt`: the side whose `previousTitles` contains the other side's title wins; else a chosen title (`user`/`tool`) beats an automatic one; two different chosen titles without history → ABORT
+5. rest of the entry: version `(lastActivityAt, lastFocusedAt|0)` differs → newer wins; the merged entry is written to every side that differs from it
+6. equal version, only `BACKGROUND_FIELDS` (`prs`, `prState`, `prNumber`, `prUrl`, `prRepository`) differ → newer file mtime wins
+7. anything else (incl. two different automatic titles at equal version) → **ABORT** the whole run, write `BLOCKED`, one notification
 
 Never touched: `~/.claude/projects`, `scheduled-tasks.json`, `backlog/`, `archived-sessions.idx`,
 `local-agent-mode-sessions` (Cowork), `config.json` content (OAuth cache — only its mtime is used),
@@ -63,7 +65,8 @@ ccd-org-sync unblock                      # resume after a conflict or rollback
 - Not yet verified: when a newer entry lands in the org that is **active** at that moment (switch within the quiet window), Desktop may keep its stale in-memory copy and re-write it on the next focus; only metadata could regress, never the transcript.
 - `archived-sessions.idx` is per org and not synced; archive state is carried by the entry's `isArchived` flag only.
 - Deleting a session in one org is not propagated; the copy in the other org stays (not resurrected where a tombstone exists).
-- If activity favours one side and focus the other, the side with the newer `lastActivityAt` wins.
+- If activity favours one side and focus the other, the side with the newer `lastActivityAt` wins for every field except the title group (merged separately, see rule 4).
+- Verified live: create, continue (both directions), fast switch, rename, archive. Deletion is intentionally not propagated.
 - `sync.log` / `launchd.log` are not rotated (a few lines per run).
 
 ## Uninstall
