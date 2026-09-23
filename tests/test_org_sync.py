@@ -130,6 +130,11 @@ class OrgSyncTest(unittest.TestCase):
         r = self.run_sync('sync'); self.assertIn('"dead_skipped": 1', r.stdout)
         self.assertIsNone(self.get(TEAM, 'z'))
 
+    def test_scheduled_task_runs_not_copied(self):
+        self.put(MAX, entry('s', scheduledTaskId='task-1'))
+        r = self.run_sync('sync'); self.assertIn('"scheduled_task_skipped": 1', r.stdout)
+        self.assertIsNone(self.get(TEAM, 's'))
+
     def test_only_one_session(self):
         self.put(MAX, entry('a')); self.put(MAX, entry('b'))
         self.assertEqual(self.run_sync('sync', '--only', 'local_a').returncode, 0)
