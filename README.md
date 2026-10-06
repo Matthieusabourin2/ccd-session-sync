@@ -28,7 +28,7 @@ CCD_PAIR="$PAIR" bin/ccd-org-sync sync
 ./install-org-sync.sh "$PAIR"                        # ~/bin/ccd-org-sync + one launchd agent
 ```
 From then on you just switch orgs natively. The only manual steps left:
-- On a **"ccd-org-sync: BLOCKED"** notification, follow the runbook, then run `ccd-org-sync unblock`.
+- On a **"ccd-org-sync: conflict"** notification, only that session is left out; everything else keeps syncing. See the runbook.
 - To undo, run `ccd-org-sync rollback <ts>`. To remove, run `./install-org-sync.sh --uninstall`.
 
 Tests: `python3 -m unittest tests/test_org_sync.py`. `install-org-sync.sh` installs **only** this tool. It does not install `claude-archive-sync` or `claude-second`.

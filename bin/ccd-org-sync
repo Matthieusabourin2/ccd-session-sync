@@ -25,12 +25,13 @@ KEEP = int(os.environ.get('CCD_KEEP_SNAPSHOTS', '200'))
 MAX_CREATE = int(os.environ.get('CCD_MAX_CREATE', '25'))
 CCS = os.path.join(ROOT, 'claude-code-sessions')
 BLOCKED = os.path.join(BK, 'BLOCKED')
+CONFLICTS = os.path.join(BK, 'CONFLICTS')
 LOG = os.path.join(BK, 'sync.log')
 # app files whose mtime (never content) tells us Desktop is busy; config.json holds the OAuth cache
 BUSY_FILES = ['config.json', 'mcp-user-tool-toggles.json', 'plan-usage-history.json']
-# entry fields Desktop rewrites in the background without touching lastActivityAt/lastFocusedAt
-# (observed 2.7032: PR status refresh). Anything else differing at equal version -> ABORT.
-BACKGROUND_FIELDS = {'prs', 'prState', 'prNumber', 'prUrl', 'prRepository'}
+# Desktop rewrites many fields without touching lastActivityAt/lastFocusedAt (observed: prs on 2.7032;
+# isStarred, publishedArtifacts, peerReceipts, planPath on 2.19675). At equal version the file Desktop
+# wrote last wins; it only writes the active org and we propagate within seconds, so sides rarely diverge.
 # the title is merged on its own: a rename does not bump lastActivityAt, so it must not be lost to
 # newer activity in the other org. previousTitles (rename history) decides; else human > automatic.
 TITLE_FIELDS = {'title', 'titleSource', 'titleTurn', 'previousTitles'}
@@ -173,7 +174,7 @@ def title_winner(x, y):
 
 
 def merge(a, b):
-    """-> (merged_obj, background_refresh_used) or None when ambiguous (conflict)."""
+    """-> (merged_obj, mtime_tiebreak_used) or None when ambiguous (conflict)."""
     x, y = a[1], b[1]
     tw = title_winner(x, y)
     if tw is None:
@@ -182,9 +183,7 @@ def merge(a, b):
     bg, same_version = 0, va == vb
     if same_version:
         rest = {k for k in set(x) | set(y) if x.get(k) != y.get(k)} - TITLE_FIELDS
-        if rest and not rest <= BACKGROUND_FIELDS:
-            return None
-        if rest:  # background-only refresh: the newer file is a Desktop write (we copy verbatim)
+        if rest:  # rewrite without version bump: the newer file is the latest Desktop write
             if a[2] is None or b[2] is None or a[2].st_mtime_ns == b[2].st_mtime_ns:
                 return None
             va, vb, bg = a[2].st_mtime_ns, b[2].st_mtime_ns, 1
@@ -369,6 +368,17 @@ def check_blocked():
         raise Blocked(f'blocked ({open(BLOCKED).read().strip()}) — fix, then `ccd-org-sync unblock`')
 
 
+def report_conflicts(conflicts, msg):
+    """log + notify once per distinct conflict set (the agent runs every few minutes)."""
+    cur = '\n'.join(conflicts)
+    if os.path.exists(CONFLICTS) and open(CONFLICTS).read() == cur:
+        return
+    with open(CONFLICTS, 'w') as f:
+        f.write(cur)
+    log(f'sync {msg}')
+    notify('ccd-org-sync: conflict', msg)
+
+
 def cmd_sync(args, pair):
     dry = '--dry-run' in args
     only = args[args.index('--only') + 1] if '--only' in args else None
@@ -386,13 +396,14 @@ def cmd_sync(args, pair):
             print(f'  {kind} {sl}->{dl} {sid[:14]} cwd={s[1]["cwd"]}')
         for sid in conflicts:
             print(f'  CONFLICT {sid[:14]}')
-    if conflicts:
-        msg = f'{len(conflicts)} conflict(s): same version, different content ({conflicts[0][:14]}…)'
-        if not dry:
-            with open(BLOCKED, 'w') as f:
-                f.write(msg)
-            notify('ccd-org-sync: BLOCKED', msg)
-        raise Abort(msg)
+    if conflicts:  # skip only these entries; one ambiguous session must never stall the others
+        msg = f'{len(conflicts)} conflict(s) skipped: same version, different content ({conflicts[0][:14]}…)'
+        print(f'WARNING: {msg}', file=sys.stderr)
+        if not dry and not only:  # an --only run sees one session, not the whole conflict set
+            report_conflicts(conflicts, msg)
+    elif not dry and not only and os.path.exists(CONFLICTS):
+        os.unlink(CONFLICTS)
+        log('sync conflicts cleared')
     (la, _), (lb, _) = pair
     guards = []
     if not only and (stats[la] == 0 or stats[lb] == 0):
@@ -464,6 +475,8 @@ def cmd_status(pair):
         n = len(glob.glob(os.path.join(d, 'local_*.json')))
         print(f'{label:>6}: {n:4} entries  {os.path.relpath(d, CCS)}')
     print('blocked:', open(BLOCKED).read().strip() if os.path.exists(BLOCKED) else 'no')
+    if os.path.exists(CONFLICTS):
+        print('skipped conflicts:', open(CONFLICTS).read().replace('\n', ' '))
     if os.path.exists(LOG):
         print(''.join(open(LOG).readlines()[-5:]), end='')
 

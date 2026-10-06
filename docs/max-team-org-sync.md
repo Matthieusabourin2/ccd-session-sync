@@ -12,6 +12,7 @@
 | Activation rewrites ~11 entries with identical content (mtime only) | per-field diff watcher (`fields=[]`) |
 | Opening a session regenerates org-bound fields (`remoteMcpServersConfig`…) | per-field diff watcher |
 | `prs` is refreshed in the background without bumping timestamps | first real conflict, field-level diff |
+| Desktop 2.19675 also rewrites `isStarred`, `publishedArtifacts`, `peerReceipts`, `planPath` without bumping timestamps (a star/unstar is one) | 2026-10-06 outage: 5 equal-version conflicts, field-level diff |
 | A rename sets `titleSource=user` and pushes the old title to `previousTitles`, without bumping `lastActivityAt` | live rename test (the rename was first lost, then fixed) |
 | `ownerAccountId` / `spaces-present` do **not** change on an org switch | before/after diff → upstream `ccd-migrate-auto` never fires here |
 
@@ -24,8 +25,10 @@ Per `sessionId` present in either org:
 3. identical bytes or identical JSON → nothing
 4. the **title group** (`title`, `titleSource`, `titleTurn`, `previousTitles`) is merged on its own, because a rename does not bump `lastActivityAt`: the side whose `previousTitles` contains the other side's title wins (if both do — a rename was undone — the history that strictly extends the other wins, else ABORT); else a chosen title (`user`/`tool`) beats an automatic one; two different chosen titles without history → ABORT
 5. rest of the entry: version `(lastActivityAt, lastFocusedAt|0)` differs → newer wins; the merged entry is written to every side that differs from it
-6. equal version, only `BACKGROUND_FIELDS` (`prs`, `prState`, `prNumber`, `prUrl`, `prRepository`) differ → newer file mtime wins
-7. anything else (incl. two different automatic titles at equal version) → **ABORT** the whole run, write `BLOCKED`, one notification
+6. equal version, any other field differs → newer file mtime wins (the last Desktop write; Desktop writes only the active org and the agent propagates within seconds, so both sides rarely diverge)
+7. still ambiguous (equal mtime too, or two different automatic titles at equal version) → **skip that entry only**, the rest syncs; logged and notified once per distinct conflict set (`CONFLICTS` file)
+
+Until 2026-10-06, rule 7 aborted the whole run and wrote `BLOCKED`. One conflict on 2026-09-25 stalled every sync for 11 days after a single, missed notification. `BLOCKED` is now set only by a rollback.
 
 Never touched: `~/.claude/projects`, `scheduled-tasks.json`, `backlog/`, `archived-sessions.idx`,
 `local-agent-mode-sessions` (Cowork), `config.json` content (OAuth cache — only its mtime is used),
@@ -48,20 +51,21 @@ Keychain, cookies.
 ccd-org-sync status                       # counts per org, blocked?, last log lines
 ccd-org-sync sync --dry-run --verbose     # what would change; NO FILES MODIFIED
 ccd-org-sync rollback <ts>                # restore a snapshot (verifies SHA-256), then blocks the agent
-ccd-org-sync unblock                      # resume after a conflict or rollback
+ccd-org-sync unblock                      # resume after a rollback
 ```
 (`CCD_PAIR` must be set for `status`/`sync`; the agent has it in its plist.)
 
-### When you get a "ccd-org-sync: BLOCKED" notification
-1. `ccd-org-sync sync --dry-run --verbose` → note the conflicting session id.
+### When you get a "ccd-org-sync: conflict" notification
+Everything else keeps syncing; only the listed session stays as-is on each side.
+1. `ccd-org-sync status` (or `sync --dry-run --verbose`) → note the conflicting session id.
 2. Compare the two `local_<id>.json` field **names** that differ (never paste content anywhere).
-3. If it is a new background-refresh field, add it to `BACKGROUND_FIELDS` with a test; otherwise decide manually.
-4. `ccd-org-sync unblock`.
+3. Usually it resolves itself at the next activity in that session (newer version wins). Otherwise decide manually.
 
 ## Known limits
 - If you switch org less than ~15 s after the last activity, the newest metadata (title, turn count, a brand-new session) lands after the switch and shows on the next switch. Transcript content is unaffected: it is read directly from the shared `.jsonl`.
 - Internal, undocumented format: a Desktop update that changes the schema makes the tool refuse to write (fail closed) — check `sync.log`.
 - The initial bulk migration was run with Desktop fully quit; steady-state runs write while Desktop runs, mostly into the inactive org.
+- Same window, rule 6: a star/unstar (no version bump) followed by a switch within ~15 s can be reverted, because activating the other org bumps the mtime of its stale copy, which then wins. Re-star once the switch has settled.
 - Not yet verified: when a newer entry lands in the org that is **active** at that moment (switch within the quiet window), Desktop may keep its stale in-memory copy and re-write it on the next focus; only metadata could regress, never the transcript.
 - `archived-sessions.idx` is per org and not synced; archive state is carried by the entry's `isArchived` flag only.
 - Deleting a session in one org is not propagated; the copy in the other org stays (not resurrected where a tombstone exists).

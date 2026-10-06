@@ -85,17 +85,23 @@ class OrgSyncTest(unittest.TestCase):
         self.assertEqual(self.run_sync('sync').returncode, 0)
         self.assertEqual(self.get(MAX, 'c')['title'], 'new')
 
-    def test_ambiguous_conflict_aborts_and_blocks(self):
+    def test_ambiguous_conflict_skips_only_that_entry(self):
+        # real outage 2026-09-25 -> 10-06: one conflict blocked the whole sync for 11 days
         self.put(MAX, entry('c', title='x')); self.put(TEAM, entry('c', title='y'))
         self.put(MAX, entry('a'))
-        before = self.tree_hash()
         r = self.run_sync('sync')
-        self.assertEqual(r.returncode, 1); self.assertIn('conflict', r.stderr)
-        self.assertEqual(before, self.tree_hash())          # nothing written, not even 'a'
-        self.assertTrue(os.path.exists(os.path.join(self.bk, 'BLOCKED')))
-        self.assertEqual(self.run_sync('sync').returncode, 1)  # stays blocked
-        self.run_sync('unblock')
-        self.assertIn('conflict', self.run_sync('sync').stderr)
+        self.assertEqual(r.returncode, 0, r.stderr); self.assertIn('conflict', r.stderr)
+        self.assertEqual(self.get(TEAM, 'a'), self.get(MAX, 'a'))   # the others still sync
+        self.assertEqual((self.get(MAX, 'c')['title'], self.get(TEAM, 'c')['title']), ('x', 'y'))  # untouched
+        self.assertFalse(os.path.exists(os.path.join(self.bk, 'BLOCKED')))
+        self.put(MAX, entry('b'))
+        self.assertEqual(self.run_sync('sync').returncode, 0)
+        self.assertIsNotNone(self.get(TEAM, 'b'))                  # later runs keep syncing
+        log = open(os.path.join(self.bk, 'sync.log')).read()
+        self.assertEqual(log.count('conflict(s) skipped'), 1)      # logged once per conflict set
+        self.put(TEAM, entry('c', title='x'))                      # resolved
+        self.assertEqual(self.run_sync('sync').returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.bk, 'CONFLICTS')))
 
     def test_background_pr_refresh_newer_file_wins(self):
         self.put(MAX, entry('c', prs=[{'state': 'OPEN'}]))
@@ -105,11 +111,30 @@ class OrgSyncTest(unittest.TestCase):
         r = self.run_sync('sync'); self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.get(MAX, 'c')['prs'], [{'state': 'MERGED'}])
 
-    def test_background_field_plus_other_field_still_aborts(self):
-        self.put(MAX, entry('c', prs=[1], cwd='/p/x'))
-        self.put(TEAM, entry('c', prs=[2], cwd='/p/y'))
-        os.utime(os.path.join(self.org(MAX), 'local_c.json'), (1, 1))
+    def test_equal_version_any_field_newer_file_wins(self):
+        # real case (Desktop 2.19675): un-starred under Max, no version bump; Team still starred
+        self.put(TEAM, entry('c', isStarred=True, publishedArtifacts=None))
+        self.put(MAX, entry('c', isStarred=False, publishedArtifacts=[{'url': 'u'}]))
+        os.utime(os.path.join(self.org(TEAM), 'local_c.json'), (1, 1))
+        r = self.run_sync('sync'); self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('conflict', r.stderr)
+        self.assertEqual(self.get(TEAM, 'c'), self.get(MAX, 'c'))
+        self.assertFalse(self.get(TEAM, 'c')['isStarred'])
+
+    def test_only_run_leaves_conflict_record_alone(self):
+        self.put(MAX, entry('c', title='x')); self.put(TEAM, entry('c', title='y')); self.put(MAX, entry('a'))
+        self.run_sync('sync')
+        self.assertEqual(self.run_sync('sync', '--only', 'local_a').returncode, 0)
+        self.assertTrue(os.path.exists(os.path.join(self.bk, 'CONFLICTS')))
+        self.run_sync('sync')
+        self.assertEqual(open(os.path.join(self.bk, 'sync.log')).read().count('conflict(s) skipped'), 1)
+
+    def test_equal_version_equal_mtime_is_conflict(self):
+        self.put(MAX, entry('c', isStarred=True)); self.put(TEAM, entry('c', isStarred=False))
+        for o in (MAX, TEAM):
+            os.utime(os.path.join(self.org(o), 'local_c.json'), ns=(10**18, 10**18))
         self.assertIn('conflict', self.run_sync('sync').stderr)
+        self.assertNotEqual(self.get(MAX, 'c'), self.get(TEAM, 'c'))
 
     def test_rename_survives_newer_activity_in_other_org(self):
         # real case: renamed under Max (no activity bump) while Team got a newer message
