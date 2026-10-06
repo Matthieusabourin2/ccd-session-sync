@@ -1,13 +1,13 @@
 # ccd-org-sync — runbook (Personal/Max ↔ Team, same account)
 
-## Observed facts it relies on (Claude Desktop 2.7032, Claude Code 2.1.278, macOS 26.7)
+## Observed facts it relies on (Claude Desktop 2.7032, re-checked on 2.19675 on 2026-10-06; Claude Code 2.1.278; macOS 26.7)
 
 | Fact | How it was established |
 |---|---|
 | Sidebar index is per org: `claude-code-sessions/<account>/<org>/local_<uuid>.json` | directory audit; `list_sessions` = exactly the active org's entries |
 | Transcripts are org-agnostic: `~/.claude/projects/<cwd>/<cliSessionId>.jsonl` | every live entry resolves there; same file continued under both orgs |
 | Sidebar folders have no separate index (derived from entry `cwd`) | no project path in Local Storage / IndexedDB / Session Storage; no custom groups |
-| The index is re-read on every native switch — no restart needed | user-confirmed, 4 switches |
+| The index is re-read on every native switch, no restart needed | user-confirmed, 4 switches; again on 2.19675 after the 2026-10-06 fix |
 | Desktop only writes the **active** org's dir | read-only watcher: 0 writes to the inactive org for minutes after each switch |
 | Activation rewrites ~11 entries with identical content (mtime only) | per-field diff watcher (`fields=[]`) |
 | Opening a session regenerates org-bound fields (`remoteMcpServersConfig`…) | per-field diff watcher |
@@ -48,7 +48,7 @@ Keychain, cookies.
 ## Commands
 
 ```bash
-ccd-org-sync status                       # counts per org, blocked?, last log lines
+ccd-org-sync status                       # counts per org, blocked?, skipped conflicts, last log lines
 ccd-org-sync sync --dry-run --verbose     # what would change; NO FILES MODIFIED
 ccd-org-sync rollback <ts>                # restore a snapshot (verifies SHA-256), then blocks the agent
 ccd-org-sync unblock                      # resume after a rollback
@@ -61,6 +61,13 @@ Everything else keeps syncing; only the listed session stays as-is on each side.
 2. Compare the two `local_<id>.json` field **names** that differ (never paste content anywhere).
 3. Usually it resolves itself at the next activity in that session (newer version wins). Otherwise decide manually.
 
+### After a long outage (the agent was stopped, blocked or uninstalled)
+Sessions created in the meantime exceed the 25-creation cap, so every agent run aborts until you catch up by hand.
+1. `ccd-org-sync status`. If it says `blocked`, check that no rollback is in progress, then `ccd-org-sync unblock`.
+2. `ccd-org-sync sync --dry-run --verbose`. Expect 0 conflicts, then read the list of creations.
+3. `ccd-org-sync sync --allow-bulk`, then `touch ~/.claude/ccd-session-sync-backups/<ts>/PINNED` so pruning never drops that snapshot.
+4. Wait for the next agent run: `launchctl list | grep ccd-session` must show exit `0`.
+
 ## Known limits
 - If you switch org less than ~15 s after the last activity, the newest metadata (title, turn count, a brand-new session) lands after the switch and shows on the next switch. Transcript content is unaffected: it is read directly from the shared `.jsonl`.
 - Internal, undocumented format: a Desktop update that changes the schema makes the tool refuse to write (fail closed) — check `sync.log`.
@@ -70,7 +77,7 @@ Everything else keeps syncing; only the listed session stays as-is on each side.
 - `archived-sessions.idx` is per org and not synced; archive state is carried by the entry's `isArchived` flag only.
 - Deleting a session in one org is not propagated; the copy in the other org stays (not resurrected where a tombstone exists).
 - If activity favours one side and focus the other, the side with the newer `lastActivityAt` wins for every field except the title group (merged separately, see rule 4).
-- Verified live: create, continue (both directions), fast switch, rename, archive. Deletion is intentionally not propagated.
+- Verified live: create, continue (both directions), fast switch, rename, archive. Deletion is intentionally not propagated. Re-verified on 2.19675 (2026-10-06): after the catch-up, sessions created under Max show up under Team, and a continuation under Team shows back under Max.
 - `sync.log` / `launchd.log` are not rotated (a few lines per run).
 
 ## Uninstall

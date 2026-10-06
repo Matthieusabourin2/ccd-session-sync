@@ -5,7 +5,7 @@
 Desktop keeps one sidebar index per org:
   ~/Library/Application Support/Claude/claude-code-sessions/<account>/<org>/local_<uuid>.json
 Transcripts live org-agnostically in ~/.claude/projects and are never touched here.
-Observed (Desktop 2.7032): the app re-reads the index on every org switch and only writes the
+Observed (Desktop 2.7032, re-checked 2.19675): the app re-reads the index on every org switch and only writes the
 ACTIVE org's dir, so merging entries into the other dir makes them appear on the next switch.
 
   ccd-org-sync sync [--dry-run] [--only <sessionId>] [--verbose] [--allow-bulk]

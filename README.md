@@ -14,22 +14,25 @@ Claude Desktop keeps one Code sidebar index **per org**. When you use the native
   claude-code-sessions/<acct>/<MAX org>/local_*.json   ◄──┐
   claude-code-sessions/<acct>/<TEAM org>/local_*.json  ◄──┤ union merge, per entry:
                                                            │ newer (lastActivityAt, lastFocusedAt) wins,
-  launchd WatchPaths on both dirs ──► ccd-org-sync sync ──┘ equal+different → ABORT
+  launchd WatchPaths on both dirs ──► ccd-org-sync sync ──┘ equal → newer file wins, still tied → skip entry
 ```
 Desktop only writes the active org's index and re-reads the index on every switch. Whatever you do under one org is therefore merged into the other org's index within seconds, and it's there the next time you switch. You don't need a restart or a manual command. Every writing run takes a SHA-256 manifest snapshot, so it can be rolled back. Full rules, observed facts and safety mechanics are in [docs/max-team-org-sync.md](docs/max-team-org-sync.md).
 
 ### 3. How to use it
 Prereqs: macOS, `python3`, Claude Desktop logged in, and the two org ids from `ls ~/Library/Application\ Support/Claude/claude-code-sessions/<account>/`.
 ```bash
+git clone https://github.com/Matthieusabourin2/ccd-session-sync && cd ccd-session-sync
 PAIR="MAX=<account>/<max-org>,TEAM=<account>/<team-org>"
 CCD_PAIR="$PAIR" bin/ccd-org-sync sync --dry-run     # preview, writes nothing
-# first bulk merge with Desktop fully quit (Cmd+Q), then relaunch:
-CCD_PAIR="$PAIR" bin/ccd-org-sync sync
+# first bulk merge with Desktop fully quit (Cmd+Q), then relaunch.
+# --allow-bulk lifts the 25-creation cap; use it only after reading the dry-run:
+CCD_PAIR="$PAIR" bin/ccd-org-sync sync --allow-bulk
 ./install-org-sync.sh "$PAIR"                        # ~/bin/ccd-org-sync + one launchd agent
 ```
 From then on you just switch orgs natively. The only manual steps left:
 - On a **"ccd-org-sync: conflict"** notification, only that session is left out; everything else keeps syncing. See the runbook.
 - To undo, run `ccd-org-sync rollback <ts>`. To remove, run `./install-org-sync.sh --uninstall`.
+- After you change the code, run `./install-org-sync.sh "$PAIR"` again. The agent runs the copy in `~/bin`, not the repo.
 
 Tests: `python3 -m unittest tests/test_org_sync.py`. `install-org-sync.sh` installs **only** this tool. It does not install `claude-archive-sync` or `claude-second`.
 
