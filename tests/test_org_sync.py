@@ -8,9 +8,17 @@ MAX = f'{ACCT}/aaaaaaaa-0000-0000-0000-000000000000'
 TEAM = f'{ACCT}/bbbbbbbb-0000-0000-0000-000000000000'
 
 
+# the three keys that make a real entry ~540 KB (83 % / 15 % / 2 % of 662 MB on 2026-11-05).
+# The sync never reads them and must copy them through untouched; fixtures carry them so that a
+# cache feeding a write — which would silently drop them — fails the suite instead of passing it.
+HEAVY = {'remoteMcpServersConfig': {'servers': [{'name': f's{i}', 'cmd': 'x' * 40} for i in range(20)]},
+         'enabledMcpTools': [f'mcp__srv__tool_{i}' for i in range(50)],
+         'promptAppendSnapshot': 'z' * 200}
+
+
 def entry(n, act=1000, focus=None, **kw):
     e = {'sessionId': f'local_{n}', 'cliSessionId': f'cli-{n}', 'cwd': '/p/alpha',
-         'createdAt': 1, 'lastActivityAt': act, 'title': 't'}
+         'createdAt': 1, 'lastActivityAt': act, 'title': 't', **HEAVY}
     if focus is not None:
         e['lastFocusedAt'] = focus
     e.update(kw)
@@ -59,6 +67,19 @@ class OrgSyncTest(unittest.TestCase):
                  CCD_PAIR=f'MAX={MAX},TEAM={TEAM}')
         e.update(env)
         return subprocess.run([PYTHON, SCRIPT, *args], env=e, capture_output=True, text=True)
+
+    def stats(self, r):
+        """the sidebar stats block (a run may print a tasks block before it)."""
+        dec, i = json.JSONDecoder(), 0
+        while (i := r.stdout.find('{', i)) != -1:
+            obj, end = dec.raw_decode(r.stdout[i:])
+            if 'cache_hit' in obj:
+                return obj
+            i += end
+        raise AssertionError(f'no sidebar stats block in {r.stdout!r}')
+
+    def cache_file(self):
+        return os.path.join(self.bk, 'index-cache.json')
 
     def tree_hash(self):
         h = hashlib.sha256()
@@ -429,6 +450,127 @@ class OrgSyncTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('T1', self.tasks(TEAM) or {})       # tasks mirrored
         self.assertIsNotNone(self.get(TEAM, 'a'))         # and the sidebar entry still synced
+
+    # --- index cache: it may only rule work out, never feed a write -----------------------
+
+    def test_warm_cache_plans_exactly_what_a_cold_pass_plans(self):
+        """same ops, with the second pass answered almost entirely from the cache."""
+        self.put(TEAM, entry('t0'))
+        for n in ('a', 'b', 'c'):
+            self.put(MAX, entry(n))
+        self.put(TEAM, entry('c', act=3000, title='newer'))          # an UPD as well as NEWs
+        cold = self.run_sync('sync', '--dry-run', '--verbose')
+        warm = self.run_sync('sync', '--dry-run', '--verbose')
+        self.assertEqual(cold.returncode, 0, cold.stderr)
+        ops = lambda r: sorted(l for l in r.stdout.splitlines() if l.startswith('  '))
+        self.assertEqual(ops(warm), ops(cold))
+        self.assertTrue(ops(cold), cold.stdout)
+        self.assertEqual(self.stats(cold)['cache_hit'], 0)           # nothing cached yet
+        self.assertEqual(self.stats(warm)['cache_miss'], 0)          # all five answered from cache
+        self.assertEqual(self.stats(warm)['cache_hit'], 5)
+
+    def test_merged_write_keeps_the_heavy_keys_with_a_warm_cache(self):
+        """the dangerous path, and the reason the cache may never feed a write: a real merge
+        serializes the whole object, so BOTH sides must come from the files. Fed from the cache's
+        projection it would write an entry stripped of 98 % of its content.
+        The divergence is laid down FIRST and a dry run then fills the cache without writing, so
+        both sides are cache HITS when the real run reaches merge(). Filling the cache from an
+        identical pair instead would leave the rewritten side a cache miss, and the entry would
+        reach merge() through parse_entry — the invariant would never be exercised."""
+        self.put(TEAM, entry('a', title='mine', titleSource='user'))  # human title, older
+        self.put(MAX, entry('a', act=2000, title='auto'))             # newer, automatic title
+        d = self.run_sync('sync', '--dry-run')
+        self.assertEqual(self.stats(d)['cache_miss'], 2)              # cold: both sides read
+        r = self.run_sync('sync', '--verbose')
+        self.assertEqual(self.stats(r)['cache_hit'], 2, self.stats(r))   # warm: both from cache
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # version winner (MAX, newer) and title winner (TEAM, human) differ, so the merged object
+        # equals neither side: the only path that writes json.dumps(merged).
+        self.assertIn('MERGE', r.stdout)
+        for o in (MAX, TEAM):
+            got = self.get(o, 'a')
+            self.assertEqual(got['remoteMcpServersConfig'], HEAVY['remoteMcpServersConfig'], o)
+            self.assertEqual(got['enabledMcpTools'], HEAVY['enabledMcpTools'], o)
+            self.assertEqual(got['promptAppendSnapshot'], HEAVY['promptAppendSnapshot'], o)
+
+    def test_new_entry_is_copied_byte_for_byte(self):
+        self.put(TEAM, entry('t0')); self.put(MAX, entry('a'))
+        self.run_sync('sync')
+        src = open(os.path.join(self.org(MAX), 'local_a.json'), 'rb').read()
+        self.assertEqual(open(os.path.join(self.org(TEAM), 'local_a.json'), 'rb').read(), src)
+        self.assertIn(b'remoteMcpServersConfig', src)
+
+    def test_a_corrupt_cache_costs_speed_not_correctness(self):
+        self.put(TEAM, entry('t0')); self.put(MAX, entry('a'))
+        self.run_sync('sync')                                         # writes a cache
+        with open(self.cache_file(), 'w') as f:
+            f.write('{not json at all')
+        self.put(MAX, entry('b'))
+        r = self.run_sync('sync')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNotNone(self.get(TEAM, 'b'))
+        self.assertEqual(self.stats(r)['cache_hit'], 0)               # fell back to a cold pass
+        self.assertEqual(json.load(open(self.cache_file()))['format'], 1)   # and rebuilt it
+
+    def test_a_cache_of_another_format_is_ignored(self):
+        self.put(TEAM, entry('t0')); self.put(MAX, entry('a'))
+        self.run_sync('sync')
+        c = json.load(open(self.cache_file())); c['format'] = 99
+        self.write(self.cache_file(), c)
+        r = self.run_sync('sync', '--dry-run')
+        self.assertEqual(self.stats(r)['cache_hit'], 0)
+
+    def test_a_rewritten_entry_misses_the_cache(self):
+        self.put(TEAM, entry('t0')); self.put(MAX, entry('a'))
+        self.run_sync('sync')
+        # the cache is saved at the end of plan(), before apply() writes: the files a pass writes
+        # carry a new stat and are re-read once on the next pass. One more pass reaches steady state.
+        self.run_sync('sync', '--dry-run')
+        r = self.run_sync('sync', '--dry-run')
+        self.assertEqual(self.stats(r)['cache_miss'], 0, self.stats(r))   # steady state: all hits
+        self.put(MAX, entry('a', act=5000))                               # Desktop rewrites one entry
+        r = self.run_sync('sync', '--dry-run')
+        self.assertEqual(self.stats(r)['cache_miss'], 1, self.stats(r))
+
+    def test_read_paired_never_claims_stale_bytes_are_current(self):
+        """Tested in-process: no subprocess run can force Desktop to write between our stat and our
+        read. If read_paired returned the stat taken AFTER the read, that stat would match the file
+        as it now stands while the bytes are older — moved_since would find nothing to defer, and
+        the cache would store a fresh stat against stale bytes, so a real divergence between the
+        two orgs could stay invisible until Desktop next rewrote the file."""
+        import importlib.util, importlib.machinery, builtins, io as _io
+        ldr = importlib.machinery.SourceFileLoader('ccd_org_sync', os.path.abspath(SCRIPT))
+        spec = importlib.util.spec_from_loader('ccd_org_sync', ldr)  # the script has no .py suffix
+        mod = importlib.util.module_from_spec(spec)
+        ldr.exec_module(mod)
+
+        f = os.path.join(self.org(MAX), 'local_a.json')
+        self.write(f, entry('a'))
+        first = os.stat(f)
+        real_open, n = builtins.open, [0]
+
+        def rewrite_after_every_read(path, *a, **k):          # Desktop, writing without pause
+            fh = real_open(path, *a, **k)
+            mode = a[0] if a else k.get('mode', 'r')
+            if path == f and 'b' in mode and 'r' in mode:
+                data = fh.read(); fh.close()
+                n[0] += 1
+                real_open(f, 'wb').write(json.dumps(entry('a', act=1000 + n[0])).encode())
+                os.utime(f, ns=(first.st_atime_ns, first.st_mtime_ns + n[0] * 10 ** 9))
+                return _io.BytesIO(data)
+            return fh
+
+        builtins.open = rewrite_after_every_read
+        try:
+            raw, st = mod.read_paired(f)
+        finally:
+            builtins.open = real_open
+
+        now = os.stat(f)
+        self.assertTrue(raw)
+        self.assertNotEqual((st.st_mtime_ns, st.st_size), (now.st_mtime_ns, now.st_size),
+                            'the returned stat matches the current file although the bytes are '
+                            'stale: moved_since would defer nothing and the cache would lie')
 
     def test_noop_aborted_snapshot_is_pruned(self):
         self.put(TEAM, entry('t0')); self.put(MAX, entry('a'))

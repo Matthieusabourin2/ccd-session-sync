@@ -49,6 +49,16 @@ HUMAN_TITLE = {'user', 'tool'}
 # Scheduled tasks (Desktop 2.19675): one scheduled-tasks.json per org, read only when the org loads
 # (launch or switch) and rewritten whole from memory, for the ACTIVE org only. Only the active org runs
 # tasks, so we mirror the active org's list into the inactive org's file and never write the active one.
+# An index entry is huge: median 540 KB over 1 434 files, 662 MB in all (measured 2026-11-05),
+# because Desktop copies the whole MCP config into every one — remoteMcpServersConfig 83 %,
+# enabledMcpTools 15 %, promptAppendSnapshot 2 %. None of the three is read here, yet json.loads was
+# 52 s of the ~56 s a pass costs. So a pass now stats every file and parses only the few that can
+# produce an op; the rest is answered from a cache keyed on (mtime_ns, size).
+# The cache only ever RULES WORK OUT. It never feeds a write: a real merge serializes the object
+# (plan(), 'json.dumps(merged)'), so a projection reaching that path would silently drop those keys.
+CACHE = os.path.join(BK, 'index-cache.json')
+CACHE_FORMAT = 1
+PROJ_FIELDS = ('cliSessionId', 'scheduledTaskId')  # all a skip decision needs; never written out
 TASKS = 'scheduled-tasks.json'
 TASKS_HELD = os.path.join(BK, 'TASKS_HELD')
 LOGS = os.environ.get('CCD_DESKTOP_LOGS', os.path.expanduser('~/Library/Logs/Claude'))
@@ -143,23 +153,99 @@ def wait_quiet(pair):
         time.sleep(min(QUIET - idle, 5) + 0.2)
 
 
-def load_org(d):
-    """-> (entries{sid: (bytes, obj, stat)}, tombstones{sid})"""
+def read_paired(f):
+    """-> (bytes, stat) that describe the same file version. Desktop may write while we read, and a
+    stat taken after the read would then describe bytes we never saw — deferral would miss it.
+    When the file will not sit still, we return the stat from BEFORE the last read: it is older than
+    the file as it now stands, so it can only cause a cache miss or a deferral, never a false hit.
+    Returning the one from after would claim these bytes are current, which is the bug this avoids:
+    moved_since would see nothing to defer, and the cache would hold a new stat with old bytes."""
+    raw, st_before = b'', None
+    for _ in range(3):
+        st = os.stat(f)
+        raw = open(f, 'rb').read()
+        st2 = os.stat(f)
+        if (st2.st_mtime_ns, st2.st_size) == (st.st_mtime_ns, st.st_size):
+            return raw, st
+        st_before = st
+    return raw, st_before
+
+
+def parse_entry(raw, stem):
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        raise Abort(f'invalid JSON in {stem}.json — unknown format, no writes')
+    if not isinstance(obj, dict) or obj.get('sessionId') != stem \
+            or not isinstance(obj.get('lastActivityAt'), int) or not isinstance(obj.get('cwd'), str):
+        raise Abort(f'unexpected schema in {stem}.json — no writes')
+    return obj
+
+
+class Entry:
+    """one index file. Cheap by default — a stat, plus sha and projection from the cache; the bytes
+    are read and parsed only when a decision or a write actually needs the whole object."""
+    __slots__ = ('path', 'stem', 'st', 'sha', 'proj', '_full')
+
+    def __init__(self, path, stem, st, sha_, proj, full=None):
+        self.path, self.stem, self.st, self.sha, self.proj, self._full = path, stem, st, sha_, proj, full
+
+    def full(self):
+        """-> (bytes, obj, stat). Reads and validates now if the cache has answered so far, and
+        re-pairs st/sha/proj with the bytes just read, so the cache we save stays self-consistent."""
+        if self._full is None:
+            raw, st = read_paired(self.path)
+            obj = parse_entry(raw, self.stem)
+            self._full = (raw, obj, st)
+            self.st, self.sha = st, sha(raw)
+            self.proj = {k: obj.get(k) for k in PROJ_FIELDS}
+        return self._full
+
+
+def load_cache():
+    """-> {path: [mtime_ns, size, sha, proj]}. Anything unreadable, stale or odd means a cold pass:
+    the cache may cost speed, never correctness, and must never abort a run."""
+    try:
+        c = json.load(open(CACHE))
+        if c.get('format') != CACHE_FORMAT or c.get('proj_fields') != sorted(PROJ_FIELDS):
+            return {}
+        out = {}
+        for path, v in (c.get('files') or {}).items():
+            if (isinstance(v, list) and len(v) == 4 and isinstance(v[0], int)
+                    and isinstance(v[1], int) and isinstance(v[2], str) and isinstance(v[3], dict)):
+                out[path] = v
+        return out
+    except Exception:
+        return {}
+
+
+def save_cache(fresh):
+    try:
+        body = {'format': CACHE_FORMAT, 'proj_fields': sorted(PROJ_FIELDS), 'files': fresh}
+        data = json.dumps(body).encode()
+        atomic_write(CACHE, data, sha(data))
+    except Exception:
+        pass  # a cache we cannot write is a slow next pass, not a failed one
+
+
+def load_org(d, cache, counts):
+    """-> (entries{sid: Entry}, tombstones{sid})"""
     entries, tomb = {}, set()
     for f in glob.glob(os.path.join(d, 'deleted_*')):
         tomb.add(os.path.basename(f)[len('deleted_'):])
     for f in glob.glob(os.path.join(d, 'local_*.json')):
         stem = os.path.basename(f)[:-len('.json')]
-        raw = open(f, 'rb').read()
         st = os.stat(f)
-        try:
-            obj = json.loads(raw)
-        except ValueError:
-            raise Abort(f'invalid JSON in {os.path.basename(f)} — unknown format, no writes')
-        if not isinstance(obj, dict) or obj.get('sessionId') != stem \
-                or not isinstance(obj.get('lastActivityAt'), int) or not isinstance(obj.get('cwd'), str):
-            raise Abort(f'unexpected schema in {os.path.basename(f)} — no writes')
-        entries[stem] = (raw, obj, st)
+        hit = cache.get(f)
+        if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+            counts['cache_hit'] += 1
+            entries[stem] = Entry(f, stem, st, hit[2], hit[3])
+        else:  # new or rewritten: read it, validate it, and let it refill the cache
+            counts['cache_miss'] += 1
+            raw, st = read_paired(f)
+            obj = parse_entry(raw, stem)
+            entries[stem] = Entry(f, stem, st, sha(raw), {k: obj.get(k) for k in PROJ_FIELDS},
+                                  full=(raw, obj, st))
     return entries, tomb
 
 
@@ -219,8 +305,9 @@ def merge(a, b):
 
 def plan(pair, only=None):
     (la, da), (lb, db) = pair
-    ea, ta = load_org(da)
-    eb, tb = load_org(db)
+    cache, counts = load_cache(), dict.fromkeys(['cache_hit', 'cache_miss'], 0)
+    ea, ta = load_org(da, cache, counts)
+    eb, tb = load_org(db, cache, counts)
     tomb = ta | tb
     tx = {os.path.basename(f)[:-len('.jsonl')] for f in glob.glob(os.path.join(PROJECTS, '*', '*.jsonl'))}
     ops, conflicts = [], []
@@ -238,32 +325,37 @@ def plan(pair, only=None):
             continue
         a, b = ea.get(sid), eb.get(sid)
         if a and b:
-            if a[0] == b[0] or a[1] == b[1]:
+            if a.sha == b.sha:  # identical bytes: the cache answers this without reading either file
                 c['common_identical'] += 1
                 continue
-            res = merge(a, b)
+            af, bf = a.full(), b.full()  # candidate: from here on we work on the real objects
+            if af[1] == bf[1]:           # same object, different bytes (key order, indent)
+                c['common_identical'] += 1
+                continue
+            res = merge(af, bf)
             if res is None:
                 conflicts.append(sid)
                 continue
             merged, bg = res
             c['background_refresh'] += bg
             # write the merged entry to every side that differs from it (usually just the older one)
-            data = a[0] if merged == a[1] else b[0] if merged == b[1] else json.dumps(merged).encode()
+            data = af[0] if merged == af[1] else bf[0] if merged == bf[1] else json.dumps(merged).encode()
             m = (data, merged, None)
-            if a[1] != merged:
-                ops.append(('UPD', lb if merged == b[1] else 'MERGE', la, da, sid, m, a))
-            if b[1] != merged:
-                ops.append(('UPD', la if merged == a[1] else 'MERGE', lb, db, sid, m, b))
+            if af[1] != merged:
+                ops.append(('UPD', lb if merged == bf[1] else 'MERGE', la, da, sid, m, af))
+            if bf[1] != merged:
+                ops.append(('UPD', la if merged == af[1] else 'MERGE', lb, db, sid, m, bf))
             continue
         else:
             s = a or b
-            if s[1].get('cliSessionId') not in tx:
-                c['dead_skipped'] += 1
+            if s.proj.get('cliSessionId') not in tx:   # dead and task runs are ruled out on the
+                c['dead_skipped'] += 1                 # projection alone — no read, no parse
                 continue
-            if s[1].get('scheduledTaskId'):  # automated runs of an org's own scheduled tasks
+            if s.proj.get('scheduledTaskId'):  # automated runs of an org's own scheduled tasks
                 c['scheduled_task_skipped'] += 1
                 continue
-            op = ('NEW', la, lb, db, sid, a, None) if a else ('NEW', lb, la, da, sid, b, None)
+            sf = s.full()
+            op = ('NEW', la, lb, db, sid, sf, None) if a else ('NEW', lb, la, da, sid, sf, None)
         o = op[5][1]
         cat['archived'] += bool(o.get('isArchived'))
         cat['scheduled_task'] += bool(o.get('scheduledTaskId'))
@@ -273,12 +365,15 @@ def plan(pair, only=None):
     stats = {la: len(ea), lb: len(eb), 'common': len(set(ea) & set(eb)),
              f'{la}_only': len(set(ea) - set(eb)), f'{lb}_only': len(set(eb) - set(ea)),
              'conflicts': len(conflicts), **c, 'to_create': sum(o[0] == 'NEW' for o in ops),
-             'to_update': sum(o[0] == 'UPD' for o in ops), 'categories_of_writes': cat}
+             'to_update': sum(o[0] == 'UPD' for o in ops), 'categories_of_writes': cat, **counts}
     ids_w = {o[4] for o in ops}
     seen = {}  # {sid: {path: stat}} — an op depends on its own entry only, in either org
     for d, e in ((da, ea), (db, eb)):
         for sid in ids_w & set(e):
-            seen.setdefault(sid, {})[os.path.join(d, sid + '.json')] = e[sid][2]
+            seen.setdefault(sid, {})[os.path.join(d, sid + '.json')] = e[sid].st
+    # saved last, so an entry full() re-read carries the stat paired with the bytes we just used
+    save_cache({e.path: [e.st.st_mtime_ns, e.st.st_size, e.sha, e.proj]
+                for e in list(ea.values()) + list(eb.values())})
     return ops, conflicts, stats, seen
 
 
@@ -613,6 +708,7 @@ def cmd_sync(args, pair):
         check_blocked()  # a rollback/abort may have happened while we waited
     if not only:
         sync_tasks(args, pair, dry)
+    t0 = time.monotonic()  # the work, not the quiet wait before it
     ops, conflicts, stats, seen = plan(pair, only)
     print(json.dumps(stats, indent=1))
     if '--verbose' in args:
@@ -641,13 +737,15 @@ def cmd_sync(args, pair):
     if dry:
         print('DRY RUN — NO FILES MODIFIED')
         return
-    if not ops:
+    cache_stat = f'cache={stats["cache_hit"]}/{stats["cache_hit"] + stats["cache_miss"]}'
+    if not ops:  # logged too: a quiet pass is the one whose cost we care about
+        log(f'sync nothing-to-do {cache_stat} took={time.monotonic() - t0:.1f}s result=ok')
         return
     ts, written = apply(ops, pair, seen)
     nc = sum(o[0] == 'NEW' for o in written)
     nu = len(written) - nc
     log(f'sync snapshot={ts} created={nc} updated={nu} '
-        f'deferred={len(ops) - len(written)} result=ok')
+        f'deferred={len(ops) - len(written)} {cache_stat} took={time.monotonic() - t0:.1f}s result=ok')
     print(f'snapshot {ts}: created={nc} updated={nu}')
     # Desktop reads an org's index on launch and on switch only: a new entry written into the org it
     # already holds stays invisible until then. Say so, rather than let the session look lost.

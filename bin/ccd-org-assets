@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""ccd-org-assets — what the Team org is missing from the Max org (or vice versa): your own skills
+and your claude.ai connectors. Both live server-side per org; Desktop keeps a local cache only, so
+this tool READS that cache and never writes into it.
+
+  ccd-org-assets diff [--from MAX --to TEAM]     missing skills + connectors, nothing written
+  ccd-org-assets pack <out-dir> [--from MAX --to TEAM]
+                                                one <skill>.zip per missing skill, ready to upload
+Pair: CCD_PAIR="MAX=<acct>/<org>,TEAM=<acct>/<org>" (same as ccd-org-sync)
+
+Sources (observed on Desktop 2.19675):
+  skills     local-agent-mode-sessions/skills-plugin/<org>/<acct>/manifest.json (+ skills/<name>/)
+             only creatorType == "user" is yours; Anthropic skills are provisioned per plan.
+  connectors remoteMcpServersConfig of the org's most recently written Code session entry.
+"""
+import glob, json, os, sys, zipfile
+
+ROOT = os.environ.get('CCD_CLAUDE_DIR', os.path.expanduser('~/Library/Application Support/Claude'))
+JUNK = {'.DS_Store', '__pycache__'}
+
+
+def pair():
+    spec = os.environ.get('CCD_PAIR', '')
+    p = dict(part.split('=', 1) for part in spec.split(',') if '=' in part)
+    if len(p) != 2:
+        sys.exit('set CCD_PAIR="MAX=<acct>/<org>,TEAM=<acct>/<org>"')
+    return p
+
+
+def skills_dir(rel):
+    acct, org = rel.split('/')
+    return os.path.join(ROOT, 'local-agent-mode-sessions', 'skills-plugin', org, acct)
+
+
+def skills(rel):
+    m = json.load(open(os.path.join(skills_dir(rel), 'manifest.json')))
+    return {s['name']: s for s in m['skills']}
+
+
+def connectors(rel):
+    entries = sorted(glob.glob(os.path.join(ROOT, 'claude-code-sessions', rel, 'local_*.json')),
+                     key=os.path.getmtime, reverse=True)
+    for f in entries:
+        cfg = json.load(open(f)).get('remoteMcpServersConfig')
+        if cfg:
+            return {c['url'].rstrip('/'): c['name'] for c in cfg}
+    return {}
+
+
+def missing(p, src, dst):
+    s, d = skills(p[src]), skills(p[dst])
+    sk = sorted(n for n, x in s.items() if x.get('creatorType') == 'user' and n not in d)
+    cs, cd = connectors(p[src]), connectors(p[dst])
+    co = sorted(((n, u) for u, n in cs.items() if u not in cd), key=lambda x: x[0].lower())
+    return sk, co
+
+
+def pack(src_rel, names, out):
+    os.makedirs(out, exist_ok=True)
+    base = os.path.join(skills_dir(src_rel), 'skills')
+    for n in names:
+        root = os.path.join(base, n)
+        if not os.path.isfile(os.path.join(root, 'SKILL.md')):
+            sys.exit(f'{n}: no SKILL.md in the local cache — open the skill once under its org, then retry')
+        with zipfile.ZipFile(os.path.join(out, n + '.zip'), 'w', zipfile.ZIP_DEFLATED) as z:
+            for d, dirs, files in os.walk(root):
+                dirs[:] = sorted(x for x in dirs if x not in JUNK)
+                for f in sorted(files):
+                    if f not in JUNK:
+                        full = os.path.join(d, f)
+                        z.write(full, os.path.join(n, os.path.relpath(full, root)))
+        print(f'  {n}.zip')
+
+
+def main(a):
+    if not a or a[0] in ('-h', '--help'):
+        print(__doc__); return 0
+    p = pair()
+    src = a[a.index('--from') + 1] if '--from' in a else list(p)[0]
+    dst = a[a.index('--to') + 1] if '--to' in a else [k for k in p if k != src][0]
+    sk, co = missing(p, src, dst)
+    if a[0] == 'diff':
+        print(f'skills in {src}, missing in {dst}: {len(sk)}')
+        for n in sk:
+            print(f'  {n}')
+        print(f'connectors in {src}, missing in {dst}: {len(co)}')
+        for n, u in co:
+            print(f'  {n:<20} {u}')
+        return 0
+    if a[0] == 'pack' and len(a) > 1:
+        pack(p[src], sk, a[1])
+        print(f'{len(sk)} zip(s) in {a[1]}')
+        return 0
+    print(__doc__); return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
