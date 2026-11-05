@@ -56,9 +56,19 @@ HUMAN_TITLE = {'user', 'tool'}
 # produce an op; the rest is answered from a cache keyed on (mtime_ns, size).
 # The cache only ever RULES WORK OUT. It never feeds a write: a real merge serializes the object
 # (plan(), 'json.dumps(merged)'), so a projection reaching that path would silently drop those keys.
+# A hit rests entirely on (mtime_ns, size) telling two versions of a file apart. Nanosecond mtimes
+# make that safe here — an apply() write of rigorously identical size was still 466 us away — but it
+# is the one assumption the whole scheme leans on. Bump CACHE_FORMAT whenever PROJ_FIELDS changes or
+# parse_entry gets stricter: entries already cached would otherwise escape the new validation.
 CACHE = os.path.join(BK, 'index-cache.json')
 CACHE_FORMAT = 1
 PROJ_FIELDS = ('cliSessionId', 'scheduledTaskId')  # all a skip decision needs; never written out
+# A projection is trusted without reading the file, so a cache that is valid but WRONG — something
+# no code path here can write, since proj and sha always come from the same bytes — would keep a
+# live session out of the other org. Validation cannot catch that: the lie is well-formed. So the
+# whole cache is dropped once a day and rebuilt from the files. It costs one cold pass, and it is
+# why no mistake in here can hide a session for longer than that.
+CACHE_TTL = float(os.environ.get('CCD_CACHE_TTL', 86400))
 TASKS = 'scheduled-tasks.json'
 TASKS_HELD = os.path.join(BK, 'TASKS_HELD')
 LOGS = os.environ.get('CCD_DESKTOP_LOGS', os.path.expanduser('~/Library/Logs/Claude'))
@@ -177,9 +187,24 @@ def parse_entry(raw, stem):
     except ValueError:
         raise Abort(f'invalid JSON in {stem}.json — unknown format, no writes')
     if not isinstance(obj, dict) or obj.get('sessionId') != stem \
-            or not isinstance(obj.get('lastActivityAt'), int) or not isinstance(obj.get('cwd'), str):
+            or not isinstance(obj.get('lastActivityAt'), int) or not isinstance(obj.get('cwd'), str) \
+            or not isinstance(obj.get('cliSessionId'), (str, type(None))) \
+            or not isinstance(obj.get('scheduledTaskId'), (str, type(None))):
+        # the last two decide whether a one-sided entry is copied at all. Left untyped, a list there
+        # reached `not in tx` as an unhashable key and killed the pass with a bare TypeError.
         raise Abort(f'unexpected schema in {stem}.json — no writes')
     return obj
+
+
+def skip_reason(o, tx):
+    """why this one-sided entry must not be copied, or None. Judged first on the cached projection,
+    to spare a read, then AGAIN on the object actually read: the projection describes the file as it
+    stood at the phase-1 stat, and Desktop may have added one of these fields since."""
+    if o.get('cliSessionId') not in tx:
+        return 'dead_skipped'
+    if o.get('scheduledTaskId'):     # automated runs of an org's own scheduled tasks
+        return 'scheduled_task_skipped'
+    return None
 
 
 class Entry:
@@ -194,6 +219,8 @@ class Entry:
         """-> (bytes, obj, stat). Reads and validates now if the cache has answered so far, and
         re-pairs st/sha/proj with the bytes just read, so the cache we save stays self-consistent."""
         if self._full is None:
+            if os.environ.get('CCD_TEST_UNLINK_BEFORE_FULL') == self.stem:
+                os.unlink(self.path)   # tests only: Desktop removing an entry mid-pass
             raw, st = read_paired(self.path)
             obj = parse_entry(raw, self.stem)
             self._full = (raw, obj, st)
@@ -209,11 +236,22 @@ def load_cache():
         c = json.load(open(CACHE))
         if c.get('format') != CACHE_FORMAT or c.get('proj_fields') != sorted(PROJ_FIELDS):
             return {}
+        if not isinstance(c.get('written_at'), (int, float)) \
+                or time.time() - c['written_at'] > CACHE_TTL:
+            return {}   # too old (or undated): rebuild from the files
         out = {}
         for path, v in (c.get('files') or {}).items():
-            if (isinstance(v, list) and len(v) == 4 and isinstance(v[0], int)
+            if not (isinstance(v, list) and len(v) == 4 and isinstance(v[0], int)
                     and isinstance(v[1], int) and isinstance(v[2], str) and isinstance(v[3], dict)):
-                out[path] = v
+                continue
+            # the projection's VALUES matter as much as its shape. A list or dict here reached
+            # `not in tx` as an unhashable key: TypeError inside plan(), outside any try. And since
+            # that fires before save_cache(), the bad cache was never rewritten — the pass died
+            # every 5 minutes for good, over index files that were perfectly valid.
+            if set(v[3]) != set(PROJ_FIELDS) or not all(
+                    isinstance(x, (str, type(None))) for x in v[3].values()):
+                continue
+            out[path] = v
         return out
     except Exception:
         return {}
@@ -221,7 +259,8 @@ def load_cache():
 
 def save_cache(fresh):
     try:
-        body = {'format': CACHE_FORMAT, 'proj_fields': sorted(PROJ_FIELDS), 'files': fresh}
+        body = {'format': CACHE_FORMAT, 'proj_fields': sorted(PROJ_FIELDS),
+                'written_at': time.time(), 'files': fresh}
         data = json.dumps(body).encode()
         atomic_write(CACHE, data, sha(data))
     except Exception:
@@ -244,8 +283,11 @@ def load_org(d, cache, counts):
             counts['cache_miss'] += 1
             raw, st = read_paired(f)
             obj = parse_entry(raw, stem)
-            entries[stem] = Entry(f, stem, st, sha(raw), {k: obj.get(k) for k in PROJ_FIELDS},
-                                  full=(raw, obj, st))
+            # deliberately NOT kept as `full`: holding the bytes and the parsed object of every
+            # entry meant ~660 MB of bytes and several GB of dicts at once, and a cold pass spent
+            # its time swapping. The few candidates are read again in phase 2, which costs a
+            # handful of reads and keeps peak memory at one entry.
+            entries[stem] = Entry(f, stem, st, sha(raw), {k: obj.get(k) for k in PROJ_FIELDS})
     return entries, tomb
 
 
@@ -312,7 +354,7 @@ def plan(pair, only=None):
     tx = {os.path.basename(f)[:-len('.jsonl')] for f in glob.glob(os.path.join(PROJECTS, '*', '*.jsonl'))}
     ops, conflicts = [], []
     c = dict.fromkeys(['common_identical', 'tombstone_skipped', 'dead_skipped', 'scheduled_task_skipped',
-                       'background_refresh'], 0)
+                       'background_refresh', 'vanished_skipped'], 0)
     cat = dict.fromkeys(['archived', 'scheduled_task', 'scratch_cwd', 'worktree_cwd'], 0)
     ids = set(ea) | set(eb)
     if only:
@@ -328,7 +370,11 @@ def plan(pair, only=None):
             if a.sha == b.sha:  # identical bytes: the cache answers this without reading either file
                 c['common_identical'] += 1
                 continue
-            af, bf = a.full(), b.full()  # candidate: from here on we work on the real objects
+            try:
+                af, bf = a.full(), b.full()  # candidate: we work on the real objects from here on
+            except OSError:   # Desktop deleted it between the phase-1 scan and now. One entry it
+                c['vanished_skipped'] += 1   # removes under us must not stop all the others.
+                continue
             if af[1] == bf[1]:           # same object, different bytes (key order, indent)
                 c['common_identical'] += 1
                 continue
@@ -348,13 +394,18 @@ def plan(pair, only=None):
             continue
         else:
             s = a or b
-            if s.proj.get('cliSessionId') not in tx:   # dead and task runs are ruled out on the
-                c['dead_skipped'] += 1                 # projection alone — no read, no parse
+            why = skip_reason(s.proj, tx)   # ruled out on the projection alone: no read, no parse
+            if why:
+                c[why] += 1
                 continue
-            if s.proj.get('scheduledTaskId'):  # automated runs of an org's own scheduled tasks
-                c['scheduled_task_skipped'] += 1
+            try:
+                sf = s.full()
+            except OSError:
+                c['vanished_skipped'] += 1
                 continue
-            sf = s.full()
+            if (why := skip_reason(sf[1], tx)):   # judge again on the bytes we actually read
+                c[why] += 1
+                continue
             op = ('NEW', la, lb, db, sid, sf, None) if a else ('NEW', lb, la, da, sid, sf, None)
         o = op[5][1]
         cat['archived'] += bool(o.get('isArchived'))
@@ -735,7 +786,7 @@ def cmd_sync(args, pair):
     for g in guards:
         print(f'WARNING (a real run would abort): {g}')
     if dry:
-        print('DRY RUN — NO FILES MODIFIED')
+        print('DRY RUN — no session file modified (only the index cache was refreshed)')
         return
     cache_stat = f'cache={stats["cache_hit"]}/{stats["cache_hit"] + stats["cache_miss"]}'
     if not ops:  # logged too: a quiet pass is the one whose cost we care about

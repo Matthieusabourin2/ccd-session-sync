@@ -234,9 +234,14 @@ class OrgSyncTest(unittest.TestCase):
         self.put(MAX, entry('a')); self.put(TEAM, entry('c', act=5)); self.put(MAX, entry('c', act=9))
         before = self.tree_hash()
         r = self.run_sync('sync', '--dry-run')
-        self.assertEqual(r.returncode, 0, r.stderr); self.assertIn('NO FILES MODIFIED', r.stdout)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('no session file modified', r.stdout)
         self.assertEqual(before, self.tree_hash())
         self.assertFalse(os.path.exists(self.bk) and self.snapshots())
+        # tree_hash only walks the session tree, so it never saw what a dry run leaves in the
+        # backup dir. A dry run DOES refresh the index cache — and that is all it may touch there.
+        self.assertEqual(sorted(os.listdir(self.bk)) if os.path.exists(self.bk) else [],
+                         ['index-cache.json'])
 
     def test_tombstone_never_resurrected(self):
         self.put(MAX, entry('d')); self.put(TEAM, entry('t0'))
@@ -345,8 +350,16 @@ class OrgSyncTest(unittest.TestCase):
         e = dict(os.environ, CCD_CLAUDE_DIR=self.root, CCD_PROJECTS_DIR=os.path.dirname(self.proj),
                  CCD_BACKUP_DIR=self.bk, CCD_QUIET_SECONDS='2', CCD_NO_NOTIFY='1',
                  CCD_PAIR=f'MAX={MAX},TEAM={TEAM}')
-        p = subprocess.Popen(['python3', SCRIPT, 'sync'], env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        time.sleep(0.8)
+        p = subprocess.Popen([PYTHON, SCRIPT, 'sync'], env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # wait for the run to actually be up (it creates the backup dir first thing) instead of
+        # sleeping a fixed delay: under load the interpreter had not got there yet, and the test
+        # failed writing BLOCKED into a directory that did not exist.
+        for _ in range(300):
+            if os.path.isdir(self.bk):
+                break
+            time.sleep(0.02)
+        else:
+            self.fail('the sync never started')
         open(os.path.join(self.bk, 'BLOCKED'), 'w').write('rolling back x')
         _, err = p.communicate(timeout=30)
         self.assertEqual(p.returncode, 1); self.assertIn('blocked', err)
@@ -571,6 +584,68 @@ class OrgSyncTest(unittest.TestCase):
         self.assertNotEqual((st.st_mtime_ns, st.st_size), (now.st_mtime_ns, now.st_size),
                             'the returned stat matches the current file although the bytes are '
                             'stale: moved_since would defer nothing and the cache would lie')
+
+    # --- a cache that is readable but wrong must never be able to stall the sync ----------
+
+    def test_an_unhashable_projection_does_not_kill_the_pass(self):
+        """A list where a projection value belongs reached `not in tx` as an unhashable key:
+        TypeError inside plan(), outside any try, and raised BEFORE save_cache() — so the bad cache
+        was re-read and the pass died again every 5 minutes, over valid index files."""
+        self.put(TEAM, entry('t0')); self.put(MAX, entry('solo'))
+        self.run_sync('sync', '--dry-run')                      # writes a cache
+        c = json.load(open(self.cache_file()))
+        k = next(p for p in c['files'] if p.endswith('local_solo.json'))
+        c['files'][k][3]['cliSessionId'] = ['cli-solo']          # a list, not a string
+        self.write(self.cache_file(), c)
+        r = self.run_sync('sync')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn('TypeError', r.stderr)
+        self.assertIsNotNone(self.get(TEAM, 'solo'), 'the entry was never copied')
+        self.assertGreaterEqual(self.stats(r)['cache_miss'], 1)   # that entry alone was rejected
+        self.assertEqual(json.load(open(self.cache_file()))['format'], 1)   # and the cache rebuilt
+
+    def test_a_lying_projection_cannot_hide_a_session_past_the_cache_ttl(self):
+        """A projection that merely LIES is well-formed, so no validation can catch it: the entry is
+        skipped as a scheduled-task run and the session never reaches the other org. Nothing here
+        can write such a cache — proj and sha always come from the same bytes — so the answer is not
+        to detect it but to bound it: the cache is dropped once a day, and the session comes back.
+        This test pins both halves, because the first is the cost of the second."""
+        self.put(TEAM, entry('t0')); self.put(MAX, entry('solo'))
+        self.run_sync('sync', '--dry-run')                       # writes a cache
+        c = json.load(open(self.cache_file()))
+        k = next(p for p in c['files'] if p.endswith('local_solo.json'))
+        c['files'][k][3]['scheduledTaskId'] = 'task-that-does-not-exist'
+        self.write(self.cache_file(), c)
+
+        r = self.run_sync('sync')                                # within the TTL: hidden
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNone(self.get(TEAM, 'solo'))
+        self.assertEqual(self.stats(r)['scheduled_task_skipped'], 1)
+
+        r = self.run_sync('sync', CCD_CACHE_TTL='0')             # past it: read again, and copied
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.stats(r)['cache_hit'], 0)
+        self.assertIsNotNone(self.get(TEAM, 'solo'), 'the TTL did not rescue the session')
+
+    def test_an_index_entry_with_an_odd_cliSessionId_is_refused_explicitly(self):
+        self.put(TEAM, entry('t0'))
+        self.write(os.path.join(self.org(MAX), 'local_a.json'), entry('a', cliSessionId=['x']))
+        r = self.run_sync('sync')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('unexpected schema', r.stderr)             # not a bare TypeError
+        self.assertNotIn('TypeError', r.stderr)
+
+    def test_an_entry_deleted_mid_pass_does_not_stop_the_others(self):
+        """Desktop can remove a file between the phase-1 stat and the phase-2 read. The header of
+        the script promises the others still go through; an uncaught FileNotFoundError broke that."""
+        self.put(TEAM, entry('t0'))
+        for n in ('a', 'b', 'c'):
+            self.put(MAX, entry(n))
+        r = self.run_sync('sync', CCD_TEST_UNLINK_BEFORE_FULL='local_b')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.stats(r)['vanished_skipped'], 1, self.stats(r))
+        for n in ('a', 'c'):
+            self.assertIsNotNone(self.get(TEAM, n), f'{n} was lost with the deleted entry')
 
     def test_noop_aborted_snapshot_is_pruned(self):
         self.put(TEAM, entry('t0')); self.put(MAX, entry('a'))
