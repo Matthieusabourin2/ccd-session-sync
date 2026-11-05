@@ -60,4 +60,65 @@ Aujourd'hui : 415 communes dont 384 identiques, et 601 à un seul côté dont 59
 
 ## Revue
 
-(à remplir en fin de chantier)
+### Ce que j'avais mal attribué
+
+Le plan disait « 94 % du temps dans `json.loads` ». C'était vrai en isolation et faux comme
+explication. **Le coût dominant était la mémoire.** L'ancien `load_org` gardait les octets *et*
+l'objet parsé des 1 436 entrées en même temps. Mesuré à froid sur les vraies données, à vide :
+
+| | durée | pic RSS |
+|---|---|---|
+| installé | **1 927 s** | **1 206 Mo** |
+| nouveau, à froid | 150 s | 69 Mo |
+| nouveau, à chaud | 15 à 34 s | 72 Mo |
+
+1,2 Go de pic, donc du swap — et c'est ce qui explique qu'un même code ait mis 59 s, 3 min 13 s
+puis 23 min selon la pression mémoire du moment. La mesure en isolation ne pouvait pas le voir :
+elle lisait 400 fichiers, pas 1 436, donc elle ne touchait jamais la limite. **Leçon : mesurer
+l'empreinte mémoire d'un passage complet, pas seulement le temps CPU d'un échantillon.**
+
+### Fait
+
+1. `took=` et `cache=` dans le journal, et un passage sans op y est désormais tracé. ✔
+2. `read_paired()` apparie stat et octets. ✔ Un défaut de ma première version — renvoyer le stat
+   d'*après* la lecture dans le cas dégénéré — a été trouvé en relecture et reproduit par une sonde
+   en process : il faisait croire à `moved_since` que rien n'avait bougé.
+3. Cache tolérant aux pannes : illisible, corrompu, d'un autre format ou périmé → passage à froid,
+   jamais d'`Abort`. ✔ Rejet **par entrée**, pas du cache entier.
+4. Deux phases dans `plan()`. ✔ Équivalence prouvée sur les vraies données : 5 ops identiques entre
+   l'installé, le neuf à froid et le neuf à chaud, les 2 conflits connus vus de part et d'autre.
+5. Fixtures portant les trois clés lourdes. ✔
+6. Relecture indépendante, puis mesure. ✔
+
+### Ce que la relecture a changé
+
+L'invariant tient : aucun chemin où des octets ou un objet venus du cache atteignent une écriture,
+vérifié sur les dix formes d'op dans un passage 100 % chaud. Mais six constats, tous reproduits :
+
+- une valeur non hachable en cache tuait le passage **toutes les 5 minutes indéfiniment**, parce que
+  le `TypeError` précédait `save_cache` : le mauvais cache n'était jamais réécrit ;
+- une projection qui *ment* est bien formée, donc indétectable, et cachait une session pour
+  toujours. Non détectable → **borné** : le cache périme en un jour (`CCD_CACHE_TTL`) ;
+- une entrée supprimée en cours de passage tuait tout le passage, contre la promesse de l'en-tête ;
+- les règles d'exclusion n'étaient jamais rejouées sur les octets réellement lus ;
+- `parse_entry` ne typait pas les deux champs qui pilotent une exclusion (préexistant) ;
+- `--dry-run` écrit le cache en affichant « NO FILES MODIFIED », et le test censé le vérifier ne
+  regardait pas le bon dossier.
+
+Mon test des clés lourdes n'exerçait pas l'invariant : il remplissait le cache depuis une paire
+identique, ce qui laissait le côté réécrit en *cache miss*. Refait selon la recette du plan.
+
+### Assumé, non corrigé
+
+Une entrée du cache n'est distinguée que par `(mtime_ns, size)`. Le relecteur a montré qu'une
+écriture d'`apply()` de taille rigoureusement identique n'était séparée que par 466 µs de `mtime`.
+C'est l'hypothèse sur laquelle tout repose. Le correctif de `read_paired` la rend sûre — un stat
+strictement plus vieux ne peut causer qu'un *miss* — et la péremption borne le reste à un jour.
+
+Hors périmètre, relevé en passant : quand *toutes* les ops d'un passage ont bougé, le script sort en
+code 1, donc launchd enregistre un échec là où il n'y a que « rien à faire ». Cosmétique.
+
+### Reste
+
+61 tests. Chacun des sept nouveaux est prouvé en retirant la seule ligne qu'il couvre. Installé le
+05/11 ; rien n'est poussé.
