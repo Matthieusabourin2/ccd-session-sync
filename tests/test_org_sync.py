@@ -381,8 +381,9 @@ class OrgSyncTest(unittest.TestCase):
         r = self.run_sync('sync', CCD_TEST_TOUCH_BEFORE_APPLY='1')
         self.assertEqual(r.returncode, 0, r.stderr)
         landed = {os.path.basename(f)[:-5] for f in glob.glob(os.path.join(self.org(TEAM), 'local_*.json'))}
-        self.assertEqual(len(landed - {'local_t0'}), 2)          # 3 planned, 1 deferred
+        self.assertEqual(len(landed - {'local_t0'}), 2)          # 4 ops planned, 1 deferred
         self.run_sync('sync')                                    # quiet run: it converges
+        self.assertIsNotNone(self.get(MAX, 't0'))                # the TEAM-only entry went the other way
         landed = {os.path.basename(f)[:-5] for f in glob.glob(os.path.join(self.org(TEAM), 'local_*.json'))}
         self.assertEqual(landed, {'local_t0', 'local_a', 'local_b', 'local_c'})
 
@@ -403,6 +404,31 @@ class OrgSyncTest(unittest.TestCase):
         self.assertIn('changed during sync', r.stderr)
         self.assertEqual(glob.glob(os.path.join(self.org(TEAM), 'local_a.json')), [])
         self.assertEqual(self.snapshots(), [])
+
+    def test_skip_is_on_disk_before_the_next_write(self):
+        """a crash right after a CAS skip must leave a manifest that still says 'skipped'.
+        Held only in memory, it claimed the skipped file had been written and rollback refused."""
+        self.put(TEAM, entry('a')); self.put(MAX, entry('a', act=2000, title='newer'))
+        self.put(MAX, entry('z'))                 # 'a' (UPD, skipped) is ordered before 'z' (NEW)
+        self.run_sync('sync', CCD_TEST_TOUCH_DEST_BEFORE_WRITE='1', CCD_TEST_CRASH_AFTER='1',
+                      CCD_KEEP_SNAPSHOTS='1')
+        man = json.load(open(os.path.join(self.bk, self.snapshots()[0], 'manifest.json')))
+        skipped = [os.path.basename(o['path']) for o in man['ops'] if o.get('skipped')]
+        self.assertEqual(skipped, ['local_a.json'], man['ops'])
+        r = self.run_sync('rollback', self.snapshots()[0])
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+
+    def test_tasks_and_sidebar_both_land_in_one_run(self):
+        """cmd_sync calls apply() twice; when both fell in the same second the snapshot dirs
+        collided and the FileExistsError killed the sidebar sync for that run."""
+        self.active(MAX)
+        self.put_tasks(MAX, [{'id': 'T1', 'cronExpression': '0 9 * * *'}])
+        self.put_tasks(TEAM, [])
+        self.put(TEAM, entry('t0')); self.put(MAX, entry('a'))
+        r = self.run_sync('sync')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('T1', self.tasks(TEAM) or {})       # tasks mirrored
+        self.assertIsNotNone(self.get(TEAM, 'a'))         # and the sidebar entry still synced
 
     def test_noop_aborted_snapshot_is_pruned(self):
         self.put(TEAM, entry('t0')); self.put(MAX, entry('a'))

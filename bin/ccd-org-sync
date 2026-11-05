@@ -455,7 +455,9 @@ def apply(ops, pair, seen):
     if not kept:
         raise Abort(f'all {len(deferred)} entry(ies) changed during sync — retry later')
     ops = kept
-    ts = time.strftime('%Y%m%d-%H%M%S') + f'-{os.getpid()}'
+    # monotonic suffix: cmd_sync calls apply() twice (tasks, then sidebar); same second + same
+    # pid once collided on the snapshot dir, and the FileExistsError killed the sidebar sync.
+    ts = time.strftime('%Y%m%d-%H%M%S') + f'-{os.getpid()}-{time.monotonic_ns() % 10**6:06d}'
     snap = os.path.join(BK, ts)
     os.makedirs(os.path.join(snap, 'files'))
     man = {'timestamp': ts, 'claude_desktop_version': desktop_version(), 'status': 'in-progress',
@@ -472,9 +474,13 @@ def apply(ops, pair, seen):
             rec['backup'] = os.path.relpath(bpath, snap)
         man['ops'].append(rec)
     write_manifest(snap, man)
+    if os.environ.get('CCD_TEST_TOUCH_DEST_BEFORE_WRITE'):  # test hook: Desktop writes the
+        for rec in man['ops']:                              # destination inside the CAS window
+            if rec['sha256_before'] is not None:
+                os.utime(rec['path'], ns=(time.time_ns() + 10**9,) * 2)
     crash_after = int(os.environ.get('CCD_TEST_CRASH_AFTER', '-1'))
     try:
-        _apply_ops(ops, man, crash_after)
+        _apply_ops(ops, man, crash_after, snap)
     except Abort:
         man['status'], man['applied'] = 'aborted', man.get('applied', 0)
         write_manifest(snap, man)
@@ -485,16 +491,20 @@ def apply(ops, pair, seen):
     return ts, [o for o, rec in zip(ops, man['ops']) if not rec.get('skipped')]
 
 
-def _apply_ops(ops, man, crash_after):
+def _apply_ops(ops, man, crash_after, snap):
     done = 0
     for (kind, sl, dl, ddir, sid, s, d), rec in zip(ops, man['ops']):
         dst = rec['path']
         # compare-and-swap: the destination must still be exactly what we planned against
-        st = os.stat(dst) if os.path.exists(dst) else None
+        try:
+            st = os.stat(dst)
+        except OSError:  # gone, or vanished between the check and the stat
+            st = None
         stale = (st is not None) if d is None else (
             st is None or (st.st_mtime_ns, st.st_size) != (d[2].st_mtime_ns, d[2].st_size))
         if stale:  # Desktop wrote the destination between plan and apply: leave it to the next run
             rec['skipped'] = True  # not written, so rollback must ignore it
+            write_manifest(snap, man)  # on disk before the next write, so a crash can still roll back
             log(f'skipped {sid[:14]} — changed in {dl} during sync')
             continue
         atomic_write(dst, s[0], rec['sha256_after'])
