@@ -7,14 +7,23 @@ Desktop keeps one sidebar index per org:
 Transcripts live org-agnostically in ~/.claude/projects and are never touched here.
 Observed (Desktop 2.7032, re-checked 2.19675): the app re-reads the index on every org switch and only writes the
 ACTIVE org's dir, so merging entries into the other dir makes them appear on the next switch.
+Scheduled tasks work the same way (scheduled-tasks.json per org): the active org's list is mirrored
+into the inactive org's file, so the tasks keep running whichever org is active.
 
   ccd-org-sync sync [--dry-run] [--only <sessionId>] [--verbose] [--allow-bulk]
   ccd-org-sync status
   ccd-org-sync rollback <snapshot-ts>
   ccd-org-sync unblock
 Pair (required): CCD_PAIR="MAX=<acct>/<org>,TEAM=<acct>/<org>"  (or --pair)
+
+Lesson (Catalia R1 triage, 20/10/2026; brain: apprentissages/etat-claude-desktop-par-org-perdu-a-la-bascule-max-team):
+treat every Max <-> Team switch as a migration, not an account change. This script only carries the
+sidebar and the scheduled tasks. Skills, MCP connectors and OAuth clients are attached to each org and
+are lost silently. After each switch, check end to end: sidebar, scheduled tasks, skills, connectors
+(gbrain needs a confidential OAuth client on Team).
 """
 import fcntl, glob, hashlib, json, os, re, shutil, subprocess, sys, time
+from datetime import datetime
 
 ROOT = os.environ.get('CCD_CLAUDE_DIR', os.path.expanduser('~/Library/Application Support/Claude'))
 PROJECTS = os.environ.get('CCD_PROJECTS_DIR', os.path.expanduser('~/.claude/projects'))
@@ -36,6 +45,16 @@ BUSY_FILES = ['config.json', 'mcp-user-tool-toggles.json', 'plan-usage-history.j
 # newer activity in the other org. previousTitles (rename history) decides; else human > automatic.
 TITLE_FIELDS = {'title', 'titleSource', 'titleTurn', 'previousTitles'}
 HUMAN_TITLE = {'user', 'tool'}
+# Scheduled tasks (Desktop 2.19675): one scheduled-tasks.json per org, read only when the org loads
+# (launch or switch) and rewritten whole from memory, for the ACTIVE org only. Only the active org runs
+# tasks, so we mirror the active org's list into the inactive org's file and never write the active one.
+TASKS = 'scheduled-tasks.json'
+TASKS_HELD = os.path.join(BK, 'TASKS_HELD')
+LOGS = os.environ.get('CCD_DESKTOP_LOGS', os.path.expanduser('~/Library/Logs/Claude'))
+MAX_TASK_DELETE = int(os.environ.get('CCD_MAX_TASK_DELETE', '2'))
+RUN_FIELDS = ('lastRunAt', 'lastScheduledFor', 'missedRunScanFloor')  # newer side wins if same schedule
+SCHEDULE_FIELDS = ('cronExpression', 'fireAt')
+TASK_FLAGS = ('sundayAliasBoundaryStamped', 'dayFieldsOrBoundaryStamped')
 
 
 class Abort(Exception):
@@ -106,8 +125,7 @@ def newest_activity(pair):
     ts = [os.path.getmtime(d) for _, d in pair]
     for _, d in pair:
         ts += [os.path.getmtime(f) for f in glob.glob(os.path.join(d, 'local_*.json'))]
-    for f in BUSY_FILES:
-        p = os.path.join(ROOT, f)
+    for p in [os.path.join(ROOT, f) for f in BUSY_FILES] + [os.path.join(d, TASKS) for _, d in pair]:
         if os.path.exists(p):
             ts.append(os.path.getmtime(p))
     return max(ts)
@@ -260,6 +278,144 @@ def plan(pair, only=None):
     return ops, conflicts, stats, seen
 
 
+def active_org(pair):
+    """label of the org whose tasks Desktop holds in memory: the last CCD scheduler init in its log.
+    None while a switch is in progress or when the log says nothing: tasks are then left alone."""
+    ids = {os.path.basename(d): label for label, d in pair}
+    for name in ('main.log', 'main1.log'):  # main.log rotates into main1.log
+        try:
+            lines = open(os.path.join(LOGS, name), errors='replace').read().splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if '[CCDScheduledTasks] Reset' in line:
+                return None
+            m = re.search(r"\[CCDScheduledTasks\] Initialized \{.*orgId: '([0-9a-f-]+)'", line)
+            if m:
+                return ids.get(m.group(1))
+    return None
+
+
+def when(v):
+    """Desktop's ISO time ('…Z') -> epoch seconds; the agent's /usr/bin/python3 (3.9) rejects a bare 'Z'."""
+    try:
+        return datetime.fromisoformat(v[:-1] + '+00:00' if v.endswith('Z') else v).timestamp()
+    except (AttributeError, TypeError, ValueError):
+        return float('-inf')
+
+
+def read_tasks(p):
+    """-> (bytes, obj, stat), or None when the file does not exist."""
+    if not os.path.exists(p):
+        return None
+    st = os.stat(p)
+    raw = open(p, 'rb').read()
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        raise Abort(f'invalid JSON in {TASKS} — unknown format, tasks left alone')
+    ts = obj.get('scheduledTasks') if isinstance(obj, dict) else None
+    if not isinstance(ts, list) or not all(isinstance(t, dict) and isinstance(t.get('id'), str) for t in ts):
+        raise Abort(f'unexpected schema in {TASKS} — tasks left alone')
+    return raw, obj, st
+
+
+def cron_field(spec, v, lo, hi):
+    for part in spec.split(','):
+        rng, _, step = part.partition('/')
+        if rng == '*':
+            a, b = lo, hi
+        elif '-' in rng:
+            a, b = map(int, rng.split('-'))
+        else:
+            a = b = int(rng)
+            if step:
+                b = hi
+        if a <= v <= b and (v - a) % int(step or 1) == 0:
+            return True
+    return False
+
+
+def cron_match(expr, t):
+    mi, h, dom, mon, dow = expr.split()
+    wd = (t.weekday() + 1) % 7  # cron: Sunday = 0 (or 7)
+    d1 = cron_field(dom, t.day, 1, 31)
+    d2 = cron_field(dow, wd, 0, 7) or (wd == 0 and cron_field(dow, 7, 0, 7))
+    day = (d1 or d2) if dom != '*' and dow != '*' else (d1 and d2)
+    return day and cron_field(mi, t.minute, 0, 59) and cron_field(h, t.hour, 0, 23) \
+        and cron_field(mon, t.month, 1, 12)
+
+
+def catch_ups(tasks, now):
+    """ids Desktop runs as soon as it loads this list: its missed-run scan finds the latest slot after
+    the last run, at most 7 days back, and runs it once; a past one-time task that never ran also fires."""
+    out = []
+    for t in tasks:
+        if not t.get('enabled'):
+            continue
+        if t.get('fireAt') is not None:
+            if t['fireAt'] <= now * 1000 and not t.get('lastRunAt'):
+                out.append(t['id'])
+            continue
+        last = when(t.get('lastScheduledFor') or t.get('lastRunAt'))
+        floor = max(last if last > float('-inf') else t.get('createdAt', 0) / 1000, now - 7 * 86400,
+                    when(t.get('missedRunScanFloor')))
+        skip = int(last // 60) if last > float('-inf') else None
+        m = int(now // 60) - 1
+        try:
+            while m * 60 > floor:
+                if m != skip and cron_match(t['cronExpression'], datetime.fromtimestamp(m * 60)):
+                    out.append(t['id'])
+                    break
+                m -= 1
+        except (KeyError, ValueError, AttributeError):
+            out.append(f'{t["id"]} (unreadable schedule)')
+    return out
+
+
+def plan_tasks(pair, allow_bulk=False, preview=False):
+    """-> (op | None, info, seen): mirror the active org's tasks into the inactive org's file.
+    Which tasks exist and their settings come from the active org; per task with an unchanged schedule,
+    the run state never moves backwards. The inactive org's retries are dropped: a retry is a run."""
+    act = active_org(pair)
+    if act is None:
+        return None, {'tasks': 'active org unknown or switching — left alone'}, {}
+    (sl, sdir), (dl, ddir) = pair if pair[0][0] == act else pair[::-1]
+    sp, dp = os.path.join(sdir, TASKS), os.path.join(ddir, TASKS)
+    s, d = read_tasks(sp), read_tasks(dp)
+    if s is None:
+        return None, {'tasks': f'{sl} has no {TASKS} — left alone'}, {}
+    old = {t['id']: t for t in d[1]['scheduledTasks']} if d else {}
+    out = []
+    for t in s[1]['scheduledTasks']:
+        o, prev = dict(t), old.get(t['id'])
+        if prev and all(prev.get(f) == t.get(f) for f in SCHEDULE_FIELDS):
+            for f in RUN_FIELDS:
+                if when(prev.get(f)) > when(o.get(f)):
+                    o[f] = prev[f]
+        out.append(o)
+    new = {'scheduledTasks': out, 'recordedSkips': (d[1].get('recordedSkips') if d else None) or {}}
+    for k in TASK_FLAGS:
+        if s[1].get(k) or (d and d[1].get(k)):
+            new[k] = True
+    data = json.dumps(new, indent=2, ensure_ascii=False).encode()  # Desktop's own serialization
+    removed = sorted(set(old) - {t['id'] for t in out})
+    info = {'tasks_active': sl, 'tasks_written_to': dl, f'tasks_{sl}': len(out), f'tasks_{dl}': len(old),
+            'tasks_added': sorted({t['id'] for t in out} - set(old)), 'tasks_removed': removed}
+    if not out and old:
+        info['tasks_held'] = f'{sl} has 0 scheduled tasks but {dl} has {len(old)} — not mirrored'
+    elif len(removed) > MAX_TASK_DELETE and not allow_bulk:
+        info['tasks_held'] = (f'would remove {len(removed)} tasks from {dl} (cap {MAX_TASK_DELETE}) — '
+                              f'review a dry-run, then sync --allow-bulk')
+    if preview:
+        loaded = list(old.values()) if 'tasks_held' in info else out
+        info[f'tasks_run_at_once_on_switch_to_{dl}'] = catch_ups(loaded, time.time())
+    if 'tasks_held' in info or (d and data == d[0]):
+        return None, info, {}
+    op = ('UPD' if d else 'NEW', sl, dl, ddir, TASKS[:-len('.json')], (data, new, None), d)
+    return op, info, {sp: s[2], **({dp: d[2]} if d else {})}
+
+
 def apply(ops, pair, seen):
     ts = time.strftime('%Y%m%d-%H%M%S') + f'-{os.getpid()}'
     snap = os.path.join(BK, ts)
@@ -368,15 +524,39 @@ def check_blocked():
         raise Blocked(f'blocked ({open(BLOCKED).read().strip()}) — fix, then `ccd-org-sync unblock`')
 
 
-def report_conflicts(conflicts, msg):
-    """log + notify once per distinct conflict set (the agent runs every few minutes)."""
-    cur = '\n'.join(conflicts)
-    if os.path.exists(CONFLICTS) and open(CONFLICTS).read() == cur:
+def report_once(path, cur, title, msg):
+    """log + notify once per distinct state (the agent runs every few minutes)."""
+    if os.path.exists(path) and open(path).read() == cur:
         return
-    with open(CONFLICTS, 'w') as f:
+    with open(path, 'w') as f:
         f.write(cur)
-    log(f'sync {msg}')
-    notify('ccd-org-sync: conflict', msg)
+    log(msg)
+    notify(title, msg)
+
+
+def sync_tasks(args, pair, dry):
+    """scheduled tasks, on their own: nothing here may stop the sidebar sync, nor the reverse."""
+    try:
+        op, info, seen = plan_tasks(pair, '--allow-bulk' in args, preview=dry or '--verbose' in args)
+    except Abort as e:
+        op, info, seen = None, {'tasks_error': str(e)}, {}
+    print(json.dumps(info, indent=1, ensure_ascii=False))
+    if dry:
+        return
+    if 'tasks_error' in info:
+        report_once(TASKS_HELD, info['tasks_error'], 'ccd-org-sync: tasks', f'tasks {info["tasks_error"]}')
+    elif 'tasks_held' in info:
+        report_once(TASKS_HELD, info['tasks_held'], 'ccd-org-sync: tasks', f'tasks {info["tasks_held"]}')
+    elif os.path.exists(TASKS_HELD) and 'tasks_active' in info:
+        os.unlink(TASKS_HELD)
+        log('tasks hold cleared')
+    if op:
+        try:
+            ts = apply([op], pair, seen)
+            log(f'tasks snapshot={ts} {info["tasks_active"]}->{info["tasks_written_to"]} '
+                f'added={len(info["tasks_added"])} removed={len(info["tasks_removed"])} result=ok')
+        except Abort as e:
+            log(f'tasks ABORT {e}')
 
 
 def cmd_sync(args, pair):
@@ -389,6 +569,8 @@ def cmd_sync(args, pair):
         lock()
         wait_quiet(pair)
         check_blocked()  # a rollback/abort may have happened while we waited
+    if not only:
+        sync_tasks(args, pair, dry)
     ops, conflicts, stats, seen = plan(pair, only)
     print(json.dumps(stats, indent=1))
     if '--verbose' in args:
@@ -400,7 +582,7 @@ def cmd_sync(args, pair):
         msg = f'{len(conflicts)} conflict(s) skipped: same version, different content ({conflicts[0][:14]}…)'
         print(f'WARNING: {msg}', file=sys.stderr)
         if not dry and not only:  # an --only run sees one session, not the whole conflict set
-            report_conflicts(conflicts, msg)
+            report_once(CONFLICTS, '\n'.join(conflicts), 'ccd-org-sync: conflict', f'sync {msg}')
     elif not dry and not only and os.path.exists(CONFLICTS):
         os.unlink(CONFLICTS)
         log('sync conflicts cleared')
@@ -432,9 +614,13 @@ def cmd_rollback(ts):
     pair = [(l, os.path.join(CCS, rel)) for l, rel in man['pair'].items()]
     dirs = {d for _, d in pair}
     for r in man['ops']:
-        if os.path.dirname(r['path']) not in dirs or not re.fullmatch(r'local_[0-9a-zA-Z-]+\.json',
+        if os.path.dirname(r['path']) not in dirs or not re.fullmatch(r'(local_[0-9a-zA-Z-]+|scheduled-tasks)\.json',
                                                                         os.path.basename(r['path'])):
             raise Abort('manifest path outside the paired index dirs — rollback refused')
+        if os.path.basename(r['path']) == TASKS:  # Desktop would ignore, then overwrite, the active org's file
+            act = active_org(pair)
+            if act is None or os.path.dirname(r['path']) == dict(pair)[act]:
+                raise Abort(f'{TASKS} of the active org (or active org unknown) — switch orgs, then roll back')
     lock()
     with open(BLOCKED, 'w') as f:  # first: no sync may re-apply what we are undoing
         f.write(f'rolling back {ts}')
@@ -473,8 +659,12 @@ def file_sha(p):
 def cmd_status(pair):
     for label, d in pair:
         n = len(glob.glob(os.path.join(d, 'local_*.json')))
-        print(f'{label:>6}: {n:4} entries  {os.path.relpath(d, CCS)}')
+        t = read_tasks(os.path.join(d, TASKS))
+        print(f'{label:>6}: {n:4} entries  {len(t[1]["scheduledTasks"]) if t else 0:3} tasks  {os.path.relpath(d, CCS)}')
+    print('tasks run in:', active_org(pair) or 'unknown (switching?)')
     print('blocked:', open(BLOCKED).read().strip() if os.path.exists(BLOCKED) else 'no')
+    if os.path.exists(TASKS_HELD):
+        print('tasks held:', open(TASKS_HELD).read())
     if os.path.exists(CONFLICTS):
         print('skipped conflicts:', open(CONFLICTS).read().replace('\n', ' '))
     if os.path.exists(LOG):

@@ -2,6 +2,7 @@
 import glob, hashlib, json, os, subprocess, tempfile, time, unittest
 
 SCRIPT = os.path.join(os.path.dirname(__file__), '..', 'bin', 'ccd-org-sync')
+PYTHON = os.environ.get('CCD_TEST_PYTHON', '/usr/bin/python3')  # the interpreter the launchd agent runs
 ACCT = '11111111-0000-0000-0000-000000000000'
 MAX = f'{ACCT}/aaaaaaaa-0000-0000-0000-000000000000'
 TEAM = f'{ACCT}/bbbbbbbb-0000-0000-0000-000000000000'
@@ -16,12 +17,21 @@ def entry(n, act=1000, focus=None, **kw):
     return e
 
 
+def task(i, **kw):
+    t = {'id': i, 'cronExpression': '0 9 * * *', 'enabled': True, 'filePath': f'/x/{i}/SKILL.md',
+         'createdAt': 1, 'cwd': '/p/alpha'}
+    t.update(kw)
+    return {k: v for k, v in t.items() if v is not None}
+
+
 class OrgSyncTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.root = os.path.join(self.tmp, 'Claude')
         self.proj = os.path.join(self.tmp, 'projects', '-p-alpha')
         self.bk = os.path.join(self.tmp, 'backups')
+        self.logs = os.path.join(self.tmp, 'logs')
+        os.makedirs(self.logs)
         for o in (MAX, TEAM):
             os.makedirs(self.org(o))
         os.makedirs(self.proj)
@@ -45,10 +55,10 @@ class OrgSyncTest(unittest.TestCase):
 
     def run_sync(self, *args, **env):
         e = dict(os.environ, CCD_CLAUDE_DIR=self.root, CCD_PROJECTS_DIR=os.path.dirname(self.proj),
-                 CCD_BACKUP_DIR=self.bk, CCD_QUIET_SECONDS='0', CCD_NO_NOTIFY='1',
+                 CCD_BACKUP_DIR=self.bk, CCD_QUIET_SECONDS='0', CCD_NO_NOTIFY='1', CCD_DESKTOP_LOGS=self.logs,
                  CCD_PAIR=f'MAX={MAX},TEAM={TEAM}')
         e.update(env)
-        return subprocess.run(['python3', SCRIPT, *args], env=e, capture_output=True, text=True)
+        return subprocess.run([PYTHON, SCRIPT, *args], env=e, capture_output=True, text=True)
 
     def tree_hash(self):
         h = hashlib.sha256()
@@ -59,6 +69,23 @@ class OrgSyncTest(unittest.TestCase):
 
     def snapshots(self):
         return sorted(d for d in os.listdir(self.bk) if os.path.isdir(os.path.join(self.bk, d)))
+
+    def active(self, o, reset=False):
+        """Desktop's log: the CCD scheduler last loaded org o (then started a switch if reset)."""
+        with open(os.path.join(self.logs, 'main.log'), 'a') as f:
+            f.write("2026-10-06 12:45:19 [info] [CCDScheduledTasks] Reset\n")
+            f.write(f"2026-10-06 12:45:24 [info] [CCDScheduledTasks] Initialized {{ accountId: '{ACCT}', "
+                    f"orgId: '{o.split('/')[1]}' }}\n")
+            if reset:
+                f.write("2026-10-06 12:50:00 [info] [CCDScheduledTasks] Reset\n")
+
+    def put_tasks(self, o, tasks, **extra):
+        with open(os.path.join(self.org(o), 'scheduled-tasks.json'), 'w') as f:
+            f.write(json.dumps({'scheduledTasks': tasks, 'recordedSkips': {}, **extra}, indent=2))
+
+    def tasks(self, o):
+        p = os.path.join(self.org(o), 'scheduled-tasks.json')
+        return {t['id']: t for t in json.load(open(p))['scheduledTasks']} if os.path.exists(p) else None
 
     # --- cases -------------------------------------------------------------------------------
     def test_max_only_and_team_only_union(self):
@@ -357,6 +384,104 @@ class OrgSyncTest(unittest.TestCase):
 
     def test_rollback_rejects_path_traversal(self):
         self.assertIn('invalid snapshot', self.run_sync('rollback', '../x').stderr)
+
+    # --- scheduled tasks ---------------------------------------------------------------------
+    def test_tasks_active_org_mirrored_into_inactive_byte_for_byte(self):
+        self.put(MAX, entry('a')); self.put(TEAM, entry('a'))
+        self.put_tasks(MAX, [task('t1'), task('t2')], sundayAliasBoundaryStamped=True)
+        self.active(MAX)
+        self.assertEqual(self.run_sync('sync').returncode, 0)
+        self.assertEqual(set(self.tasks(TEAM)), {'t1', 't2'})
+        raw = open(os.path.join(self.org(TEAM), 'scheduled-tasks.json'), 'rb').read()
+        self.assertEqual(raw, json.dumps(json.loads(raw), indent=2, ensure_ascii=False).encode())
+        self.assertTrue(json.loads(raw)['sundayAliasBoundaryStamped'])
+        before = self.tree_hash()
+        self.run_sync('sync')                       # second run: nothing left to do
+        self.assertEqual(before, self.tree_hash())
+
+    def test_tasks_empty_active_org_never_wipes_the_other(self):
+        """the state found on 2026-10-06: Team active with 0 tasks, Max with all of them."""
+        self.put(MAX, entry('a')); self.put(TEAM, entry('b'))
+        self.put_tasks(MAX, [task('t1'), task('t2'), task('t3')]); self.put_tasks(TEAM, [])
+        self.active(TEAM)
+        before = open(os.path.join(self.org(MAX), 'scheduled-tasks.json'), 'rb').read()
+        r = self.run_sync('sync')
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(before, open(os.path.join(self.org(MAX), 'scheduled-tasks.json'), 'rb').read())
+        self.assertIn('0 scheduled tasks', open(os.path.join(self.bk, 'TASKS_HELD')).read())
+        self.assertIsNotNone(self.get(TEAM, 'a'))   # the sidebar still synced
+
+    def test_tasks_never_written_while_switching_or_without_log(self):
+        self.put(MAX, entry('a')); self.put(TEAM, entry('b')); self.put_tasks(MAX, [task('t1')])
+        self.run_sync('sync')                       # no Desktop log at all
+        self.assertIsNone(self.tasks(TEAM))
+        self.active(MAX, reset=True)                # a switch has started, not finished
+        self.run_sync('sync')
+        self.assertIsNone(self.tasks(TEAM))
+        self.assertIsNotNone(self.get(TEAM, 'a'))
+
+    def test_tasks_run_state_never_moves_backwards(self):
+        self.put(MAX, entry('a')); self.put(TEAM, entry('a'))
+        self.put_tasks(TEAM, [task('t1', lastScheduledFor='2026-10-06T08:00:00.000Z')])
+        self.put_tasks(MAX, [task('t1', lastScheduledFor='2026-10-05T08:00:00.000Z', displayName='renamed')])
+        self.active(MAX)                            # Max just loaded a stale copy
+        self.run_sync('sync')
+        t = self.tasks(TEAM)['t1']
+        self.assertEqual((t['lastScheduledFor'], t['displayName']), ('2026-10-06T08:00:00.000Z', 'renamed'))
+        # a new schedule resets the run state: the active org's values are taken as they are
+        self.put_tasks(MAX, [task('t1', cronExpression='0 11 * * *', lastScheduledFor='2026-10-01T08:00:00.000Z')])
+        self.run_sync('sync')
+        self.assertEqual(self.tasks(TEAM)['t1']['lastScheduledFor'], '2026-10-01T08:00:00.000Z')
+
+    def test_tasks_retries_of_the_inactive_org_are_dropped(self):
+        self.put(MAX, entry('a')); self.put(TEAM, entry('a'))
+        self.put_tasks(TEAM, [task('t1')], runRetries={'t1': {'slot': '2026-10-06T08:00:00.000Z', 'attempts': 1,
+                                                                'notBefore': 1}})
+        self.put_tasks(MAX, [task('t1', displayName='x')]); self.active(MAX)
+        self.run_sync('sync')
+        self.assertNotIn('runRetries', json.load(open(os.path.join(self.org(TEAM), 'scheduled-tasks.json'))))
+
+    def test_tasks_deletions_capped(self):
+        self.put(MAX, entry('a')); self.put(TEAM, entry('a'))
+        self.put_tasks(TEAM, [task(f't{i}') for i in range(6)])
+        self.put_tasks(MAX, [task(f't{i}') for i in range(5)]); self.active(MAX)
+        self.run_sync('sync')                       # one deletion: propagated
+        self.assertEqual(len(self.tasks(TEAM)), 5)
+        self.put_tasks(MAX, [task('t0')])
+        self.run_sync('sync')                       # four at once: held
+        self.assertEqual(len(self.tasks(TEAM)), 5)
+        self.assertIn('would remove 4', open(os.path.join(self.bk, 'TASKS_HELD')).read())
+        self.run_sync('sync', '--allow-bulk')
+        self.assertEqual(set(self.tasks(TEAM)), {'t0'})
+        self.assertFalse(os.path.exists(os.path.join(self.bk, 'TASKS_HELD')))
+
+    def test_tasks_rollback_restores_bytes_only_into_the_inactive_org(self):
+        self.put(MAX, entry('a')); self.put(TEAM, entry('a'))
+        self.put_tasks(TEAM, [task('old')]); self.put_tasks(MAX, [task('old'), task('new')])
+        self.active(MAX)
+        before = open(os.path.join(self.org(TEAM), 'scheduled-tasks.json'), 'rb').read()
+        self.run_sync('sync')
+        ts = self.snapshots()[-1]
+        self.active(TEAM)                           # Team is now the active org: its file is Desktop's
+        self.assertIn('active org', self.run_sync('rollback', ts).stderr)
+        self.active(MAX)
+        self.assertEqual(self.run_sync('rollback', ts).returncode, 0)
+        self.assertEqual(before, open(os.path.join(self.org(TEAM), 'scheduled-tasks.json'), 'rb').read())
+
+    def test_tasks_dry_run_lists_catch_ups_and_writes_nothing(self):
+        self.put(MAX, entry('a')); self.put(TEAM, entry('a'))
+        now = time.time()
+        iso = lambda t: time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime(t))
+        self.put_tasks(MAX, [task('missed', cronExpression='* * * * *', lastScheduledFor=iso(now - 600)),
+                             task('fresh', cronExpression='0 0 1 1 *', lastScheduledFor=iso(now - 600)),
+                             task('off', enabled=False, cronExpression='* * * * *'),
+                             task('once', cronExpression=None, fireAt=int((now - 60) * 1000))])
+        self.active(MAX)
+        before = self.tree_hash()
+        r = self.run_sync('sync', '--dry-run')
+        self.assertEqual(before, self.tree_hash())
+        out = json.loads(r.stdout[:r.stdout.index('}\n') + 1])
+        self.assertEqual(sorted(out['tasks_run_at_once_on_switch_to_TEAM']), ['missed', 'once'])
 
 
 if __name__ == '__main__':
