@@ -372,12 +372,41 @@ class OrgSyncTest(unittest.TestCase):
         self.put(TEAM, entry('c', title='B', titleSource='user', previousTitles=['A', 'Y']))
         self.assertIn('conflict', self.run_sync('sync').stderr)
 
+    def test_entry_changed_during_sync_only_defers_that_entry(self):
+        """one session Desktop rewrites mid-run must not hold back the others (the whole point:
+        with a batch-wide abort, a single busy session starved every pending creation)."""
+        self.put(TEAM, entry('t0'))
+        for n in ('a', 'b', 'c'):
+            self.put(MAX, entry(n))
+        r = self.run_sync('sync', CCD_TEST_TOUCH_BEFORE_APPLY='1')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        landed = {os.path.basename(f)[:-5] for f in glob.glob(os.path.join(self.org(TEAM), 'local_*.json'))}
+        self.assertEqual(len(landed - {'local_t0'}), 2)          # 3 planned, 1 deferred
+        self.run_sync('sync')                                    # quiet run: it converges
+        landed = {os.path.basename(f)[:-5] for f in glob.glob(os.path.join(self.org(TEAM), 'local_*.json'))}
+        self.assertEqual(landed, {'local_t0', 'local_a', 'local_b', 'local_c'})
+
+    def test_entry_deleted_during_sync_is_deferred_not_fatal(self):
+        """Desktop deletes an entry mid-run: that one is deferred, the others still land
+        (an os.stat on the vanished file would otherwise abort the whole run)."""
+        self.put(TEAM, entry('t0'))
+        for n in ('a', 'b'):
+            self.put(MAX, entry(n))
+        r = self.run_sync('sync', CCD_TEST_TOUCH_BEFORE_APPLY='rm')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        landed = {os.path.basename(f)[:-5] for f in glob.glob(os.path.join(self.org(TEAM), 'local_*.json'))}
+        self.assertEqual(len(landed - {'local_t0'}), 1)
+
+    def test_every_entry_changed_writes_nothing_and_leaves_no_snapshot(self):
+        self.put(TEAM, entry('t0')); self.put(MAX, entry('a'))
+        r = self.run_sync('sync', CCD_TEST_TOUCH_BEFORE_APPLY='all')
+        self.assertIn('changed during sync', r.stderr)
+        self.assertEqual(glob.glob(os.path.join(self.org(TEAM), 'local_a.json')), [])
+        self.assertEqual(self.snapshots(), [])
+
     def test_noop_aborted_snapshot_is_pruned(self):
         self.put(TEAM, entry('t0')); self.put(MAX, entry('a'))
-        r = self.run_sync('sync', CCD_TEST_TOUCH_BEFORE_APPLY='1')
-        self.assertIn('changed during sync', r.stderr)
-        man = json.load(open(os.path.join(self.bk, self.snapshots()[0], 'manifest.json')))
-        self.assertEqual((man['status'], man['applied']), ('aborted', 0))
+        self.run_sync('sync', CCD_KEEP_SNAPSHOTS='1')
         self.put(MAX, entry('b')); self.run_sync('sync', CCD_KEEP_SNAPSHOTS='1')
         self.put(MAX, entry('d')); self.run_sync('sync', CCD_KEEP_SNAPSHOTS='1')
         self.assertEqual(len(self.snapshots()), 1)

@@ -7,6 +7,7 @@ Desktop keeps one sidebar index per org:
 Transcripts live org-agnostically in ~/.claude/projects and are never touched here.
 Observed (Desktop 2.7032, re-checked 2.19675): the app re-reads the index on every org switch and only writes the
 ACTIVE org's dir, so merging entries into the other dir makes them appear on the next switch.
+One entry that Desktop rewrites while we work is deferred to the next run; the others still go through.
 Scheduled tasks work the same way (scheduled-tasks.json per org): the active org's list is mirrored
 into the inactive org's file, so the tasks keep running whichever org is active.
 
@@ -274,7 +275,10 @@ def plan(pair, only=None):
              'conflicts': len(conflicts), **c, 'to_create': sum(o[0] == 'NEW' for o in ops),
              'to_update': sum(o[0] == 'UPD' for o in ops), 'categories_of_writes': cat}
     ids_w = {o[4] for o in ops}
-    seen = {os.path.join(d, sid + '.json'): e[sid][2] for d, e in ((da, ea), (db, eb)) for sid in ids_w if sid in e}
+    seen = {}  # {sid: {path: stat}} — an op depends on its own entry only, in either org
+    for d, e in ((da, ea), (db, eb)):
+        for sid in ids_w & set(e):
+            seen.setdefault(sid, {})[os.path.join(d, sid + '.json')] = e[sid][2]
     return ops, conflicts, stats, seen
 
 
@@ -413,10 +417,44 @@ def plan_tasks(pair, allow_bulk=False, preview=False):
     if 'tasks_held' in info or (d and data == d[0]):
         return None, info, {}
     op = ('UPD' if d else 'NEW', sl, dl, ddir, TASKS[:-len('.json')], (data, new, None), d)
-    return op, info, {sp: s[2], **({dp: d[2]} if d else {})}
+    return op, info, {TASKS[:-len('.json')]: {sp: s[2], **({dp: d[2]} if d else {})}}
+
+
+def moved_since(sid, seen):
+    """name of the first file this op was planned against that is no longer what we read, else None."""
+    for p, st in seen.get(sid, {}).items():
+        try:  # gone between the check and the stat is still 'moved': defer it, never crash the run
+            now = os.stat(p)
+        except OSError:
+            return os.path.basename(p)[:20]
+        if (now.st_mtime_ns, now.st_size) != (st.st_mtime_ns, st.st_size):
+            return os.path.basename(p)[:20]
+    return None
 
 
 def apply(ops, pair, seen):
+    """-> (snapshot timestamp, the ops actually written). An entry Desktop rewrote meanwhile is
+    deferred to the next run and never holds back the others."""
+    hook = os.environ.get('CCD_TEST_TOUCH_BEFORE_APPLY')  # test hook: Desktop rewrites entries meanwhile
+    if hook:
+        paths = [p for v in seen.values() for p in v]
+        for p in (paths if hook == 'all' else paths[:1]):
+            if hook == 'rm':
+                os.remove(p)
+            else:
+                os.utime(p, ns=(time.time_ns() + 10**9, time.time_ns() + 10**9))
+    kept, deferred = [], []
+    for op in ops:
+        m = moved_since(op[4], seen)
+        if m:
+            deferred.append(m)
+        else:
+            kept.append(op)
+    if deferred:
+        log(f'deferred {len(deferred)} entry(ies) changed during sync ({deferred[0]})')
+    if not kept:
+        raise Abort(f'all {len(deferred)} entry(ies) changed during sync — retry later')
+    ops = kept
     ts = time.strftime('%Y%m%d-%H%M%S') + f'-{os.getpid()}'
     snap = os.path.join(BK, ts)
     os.makedirs(os.path.join(snap, 'files'))
@@ -435,13 +473,7 @@ def apply(ops, pair, seen):
         man['ops'].append(rec)
     write_manifest(snap, man)
     crash_after = int(os.environ.get('CCD_TEST_CRASH_AFTER', '-1'))
-    if os.environ.get('CCD_TEST_TOUCH_BEFORE_APPLY'):  # test hook: Desktop writes the source meanwhile
-        p0 = next(iter(seen)); os.utime(p0, ns=(time.time_ns() + 10**9, time.time_ns() + 10**9))
     try:
-        for p, st in seen.items():  # nothing we read (source or destination) may have moved since
-            now = os.stat(p) if os.path.exists(p) else None
-            if now is None or (now.st_mtime_ns, now.st_size) != (st.st_mtime_ns, st.st_size):
-                raise Abort(f'{os.path.basename(p)[:20]} changed during sync')
         _apply_ops(ops, man, crash_after)
     except Abort:
         man['status'], man['applied'] = 'aborted', man.get('applied', 0)
@@ -450,7 +482,7 @@ def apply(ops, pair, seen):
     man['status'] = 'done'
     write_manifest(snap, man)
     prune()
-    return ts
+    return ts, [o for o, rec in zip(ops, man['ops']) if not rec.get('skipped')]
 
 
 def _apply_ops(ops, man, crash_after):
@@ -458,13 +490,13 @@ def _apply_ops(ops, man, crash_after):
     for (kind, sl, dl, ddir, sid, s, d), rec in zip(ops, man['ops']):
         dst = rec['path']
         # compare-and-swap: the destination must still be exactly what we planned against
-        if d is None:
-            if os.path.exists(dst):
-                raise Abort(f'{sid[:14]} appeared in {dl} during sync')
-        else:
-            st = os.stat(dst) if os.path.exists(dst) else None
-            if st is None or (st.st_mtime_ns, st.st_size) != (d[2].st_mtime_ns, d[2].st_size):
-                raise Abort(f'{sid[:14]} changed in {dl} during sync')
+        st = os.stat(dst) if os.path.exists(dst) else None
+        stale = (st is not None) if d is None else (
+            st is None or (st.st_mtime_ns, st.st_size) != (d[2].st_mtime_ns, d[2].st_size))
+        if stale:  # Desktop wrote the destination between plan and apply: leave it to the next run
+            rec['skipped'] = True  # not written, so rollback must ignore it
+            log(f'skipped {sid[:14]} — changed in {dl} during sync')
+            continue
         atomic_write(dst, s[0], rec['sha256_after'])
         done += 1
         man['applied'] = done
@@ -552,7 +584,7 @@ def sync_tasks(args, pair, dry):
         log('tasks hold cleared')
     if op:
         try:
-            ts = apply([op], pair, seen)
+            ts, _ = apply([op], pair, seen)
             log(f'tasks snapshot={ts} {info["tasks_active"]}->{info["tasks_written_to"]} '
                 f'added={len(info["tasks_added"])} removed={len(info["tasks_removed"])} result=ok')
         except Abort as e:
@@ -601,9 +633,18 @@ def cmd_sync(args, pair):
         return
     if not ops:
         return
-    ts = apply(ops, pair, seen)
-    log(f'sync snapshot={ts} created={stats["to_create"]} updated={stats["to_update"]} result=ok')
-    print(f'snapshot {ts}: created={stats["to_create"]} updated={stats["to_update"]}')
+    ts, written = apply(ops, pair, seen)
+    nc = sum(o[0] == 'NEW' for o in written)
+    nu = len(written) - nc
+    log(f'sync snapshot={ts} created={nc} updated={nu} '
+        f'deferred={len(ops) - len(written)} result=ok')
+    print(f'snapshot {ts}: created={nc} updated={nu}')
+    # Desktop reads an org's index on launch and on switch only: a new entry written into the org it
+    # already holds stays invisible until then. Say so, rather than let the session look lost.
+    act = active_org(pair)
+    blind = sum(1 for o in written if o[0] == 'NEW' and o[2] == act)
+    if blind:
+        notify('ccd-org-sync', f'{blind} new session(s) added to {act} — relaunch Claude to see them')
 
 
 def cmd_rollback(ts):
@@ -613,6 +654,7 @@ def cmd_rollback(ts):
     man = json.load(open(os.path.join(snap, 'manifest.json')))
     pair = [(l, os.path.join(CCS, rel)) for l, rel in man['pair'].items()]
     dirs = {d for _, d in pair}
+    man['ops'] = [r for r in man['ops'] if not r.get('skipped')]  # never written, never reverted
     for r in man['ops']:
         if os.path.dirname(r['path']) not in dirs or not re.fullmatch(r'(local_[0-9a-zA-Z-]+|scheduled-tasks)\.json',
                                                                         os.path.basename(r['path'])):
